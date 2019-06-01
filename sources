@@ -1,0 +1,11 @@
+TARGETNAME=test
+TARGETPATH=obj
+TARGETTYPE=DRIVER
+
+SOURCES=\
+    test.c \
+    handle.c 
+
+AMD64_SOURCES=\
+    .\amd64\64.asm 
+
