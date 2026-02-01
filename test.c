@@ -12,9 +12,9 @@ static ULONG32  VmxAdjustControls(ULONG32 Ctl, ULONG32 Msr)
 }
 
 
-SIZE_T get_segment_selector(IN SIZE_T segment_registers)
+SSIZE_T get_segment_selector(IN SSIZE_T segment_registers)
 {
-    SIZE_T segment_selector = segment_registers;
+    SSIZE_T segment_selector = segment_registers;
 
     //屏蔽低3位。即在GDT的地址，每一项8字节对齐。
     _bittestandreset64(&segment_selector, 0);
@@ -25,14 +25,14 @@ SIZE_T get_segment_selector(IN SIZE_T segment_registers)
 }
 
 
-SIZE_T Get_Segment_Base(IN SIZE_T Segment_Registers)
+SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
 {
     SIZE_T Base = 0;
-    SIZE_T BaseLow = 0;
-    SIZE_T BaseMiddle = 0;
-    SIZE_T BaseHigh = 0;
+    //SIZE_T BaseLow = 0;
+    //SIZE_T BaseMiddle = 0;
+    //SIZE_T BaseHigh = 0;
     PKGDTENTRY64 p = NULL;
-    SIZE_T Segment_Selector;
+    SSIZE_T Segment_Selector;
 
     if (_bittest64(&Segment_Registers, 2) == 1) {
         //在LDT中。
@@ -115,13 +115,13 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 {
     SIZE_T           GdtBase = (SIZE_T)(KeGetPcr()->GdtBase);//r gdtr
     AMD64_DESCRIPTOR idtr = {0};
-    PKPCR            pcr = KeGetPcr();
+    //PKPCR            pcr = KeGetPcr();
     PHYSICAL_ADDRESS IOBitmapAPA = MmAllocateContiguousPages();
     PHYSICAL_ADDRESS IOBitmapBPA = MmAllocateContiguousPages();
     PHYSICAL_ADDRESS MSRBitmapPA = MmAllocateContiguousPages();
 
     size_t x = 0;
-    unsigned char r = 0;
+    //unsigned char r = 0;
 
     VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
     VmxSecondaryProcessorBasedControls vm_procctl2;
@@ -352,7 +352,7 @@ https://msdn.microsoft.com/en-us/library/h65k4tze.aspx
 23.7 ENABLING AND ENTERING VMX OPERATION
 */
 {
-    SIZE_T FeatureControlMsr = 0; // 重命名以避免与宏冲突
+    SSIZE_T FeatureControlMsr = 0; // 重命名以避免与宏冲突
     unsigned char b = 0;
 
     FeatureControlMsr = __readmsr(IA32_FEATURE_CONTROL);
@@ -458,12 +458,11 @@ This instruction operates the same in non-64-bit modes and 64-bit mode.
 
 VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
-    KIRQL OldIrql;
-    CHAR i;
+    UNREFERENCED_PARAMETER(DriverObject);
 
-    for (i = 0; i < KeNumberProcessors; i++) {
+    for (CHAR i = 0; i < KeNumberProcessors; i++) {
         KeSetSystemAffinityThread((KAFFINITY)((ULONG_PTR)1 << i));
-        OldIrql = KeRaiseIrqlToDpcLevel();
+        KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
         VmxVmCall(NBP_HYPERCALL_UNLOAD);
         KeLowerIrql(OldIrql);
         KeRevertToUserAffinityThread();
@@ -471,13 +470,16 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 }
 
 
+DRIVER_INITIALIZE DriverEntry;
+
+
+_Use_decl_annotations_
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    NTSTATUS Status;
-    KIRQL OldIrql;
-    CHAR i;
-
     KdBreakPoint();
+
+    UNREFERENCED_PARAMETER(DriverObject);
+    UNREFERENCED_PARAMETER(RegistryPath);
 
     if (!is_support_cpuid()) {
         return STATUS_NOT_SUPPORTED;
@@ -500,10 +502,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     //读取0x48C的MSR的信息，判断是否支持EPT。
 
-    for (i = 0; i < KeNumberProcessors; i++) {
+    for (CHAR i = 0; i < KeNumberProcessors; i++) {
         KeSetSystemAffinityThread((KAFFINITY)((ULONG_PTR)1 << i));
-        OldIrql = KeRaiseIrqlToDpcLevel();
-        Status = CmSubvert();//一个汇编函数：流程是保存所有寄存器(除了段寄存器)的内容到栈里后，调用HvmSubvertCpu
+        KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
+        NTSTATUS Status = CmSubvert();//一个汇编函数：流程是保存所有寄存器(除了段寄存器)的内容到栈里后，调用HvmSubvertCpu
         KeLowerIrql(OldIrql);
         KeRevertToUserAffinityThread();
         ASSERT(NT_SUCCESS(Status));

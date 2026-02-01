@@ -10,6 +10,8 @@
 //#include <emmintrin.h>//WDK 编译。
 //#include <xmmintrin.h>//WDK 编译。
 
+#pragma warning(disable : 4201) //使用了非标准扩展: 无名称的结构/联合
+
 #define EXIT_REASON_EXCEPTION_NMI       0
 #define EXIT_REASON_EXTERNAL_INTERRUPT  1
 #define EXIT_REASON_TRIPLE_FAULT        2
