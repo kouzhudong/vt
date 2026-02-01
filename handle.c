@@ -81,7 +81,6 @@ NTSTATUS  CmGenerateIretq(PUCHAR pCode, PULONG pGeneratedCodeLength)
 VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
 {
     ULONG uTrampolineSize = 0;
-    ULONG64 NewRsp;
 
     // assume Trampoline buffer is big enough
     __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & ~0x100);     // disable TF
@@ -106,7 +105,7 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
     CmGenerateMovReg(&Trampoline[uTrampolineSize], &uTrampolineSize, REG_CR3, VmxRead(GUEST_CR3));
     CmGenerateMovReg(&Trampoline[uTrampolineSize], &uTrampolineSize, REG_CR4, VmxRead(GUEST_CR4));
 
-    NewRsp = VmxRead(GUEST_RSP);
+    ULONG64 NewRsp = VmxRead(GUEST_RSP);
     CmGenerateMovReg(&Trampoline[uTrampolineSize], &uTrampolineSize, REG_RSP, NewRsp);
 
     CmGenerateMovReg(&Trampoline[uTrampolineSize], &uTrampolineSize, REG_RAX, VmxRead(GUEST_SS_SELECTOR));
@@ -126,18 +125,15 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
 
 
 VOID reset_cr4()
-{
-    unsigned __int64 cr4 = 0;
-    __int64 b = 13;
-
-    //设置CR4的一个位。
-    cr4 = __readcr4();
+//设置CR4的一个位。
+{    
+    unsigned __int64 cr4 = __readcr4();
 
     //VMX-Enable Bit (bit 13 of CR4) — Enables VMX operation when set
     cr4 = cr4 & (~0x2000);//1>>13
 
     //_bittestandreset, _bittestandreset64
-    _bittestandreset64((__int64 *)&cr4, b);
+    _bittestandreset64((__int64 *)&cr4, 13);
 
     __writecr4(cr4);
 }
@@ -146,7 +142,6 @@ VOID reset_cr4()
 NTSTATUS VmxShutdown(PGUEST_REGS GuestRegs)
 {
     UCHAR Trampoline[0x600];
-
     VmxGenerateTrampolineToGuest(GuestRegs, Trampoline);// The code should be updated to build an approproate trampoline to exit to any guest mode.
 
     __vmx_off();

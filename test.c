@@ -27,12 +27,9 @@ SSIZE_T get_segment_selector(IN SSIZE_T segment_registers)
 
 SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
 {
-    SIZE_T Base = 0;
     //SIZE_T BaseLow = 0;
     //SIZE_T BaseMiddle = 0;
     //SIZE_T BaseHigh = 0;
-    PKGDTENTRY64 p = NULL;
-    SSIZE_T Segment_Selector;
 
     if (_bittest64(&Segment_Registers, 2) == 1) {
         //在LDT中。
@@ -44,11 +41,11 @@ SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
     }
 
     //清楚低三位的标志，也就是获取Segment Selector。
-    Segment_Selector = get_segment_selector(Segment_Registers);
+    SSIZE_T Segment_Selector = get_segment_selector(Segment_Registers);
 
-    p = (PKGDTENTRY64)((Segment_Selector)+(SIZE_T)(KeGetPcr()->GdtBase));
+    PKGDTENTRY64 p = (PKGDTENTRY64)((Segment_Selector)+(SIZE_T)(KeGetPcr()->GdtBase));
 
-    Base = (p->Bytes.BaseHigh << 24) | (p->Bytes.BaseMiddle << 16) | (p->BaseLow);
+    SIZE_T Base = (p->Bytes.BaseHigh << 24) | (p->Bytes.BaseMiddle << 16) | (p->BaseLow);
 
     //if (p->Bits.DefaultBig && Base)
     //{
@@ -67,13 +64,11 @@ SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
 
 SIZE_T get_segments_access_right(SIZE_T segment_registers)
 {
-    SIZE_T access_right;
-
     if (0 == segment_registers) {
         return 0x10000i64;//Ldtr会走这里。为何返回这个数，有待思考。
     }
 
-    access_right = get_access_rights(segment_registers);
+    SIZE_T access_right = get_access_rights(segment_registers);
     /*
     估计这个返回的是：Segment Descriptor的高DWORD，但是也排除这个 DWORD的高八位（Base 31:24）和低八位（Base 23:16）。
     */
@@ -92,14 +87,13 @@ SIZE_T get_segments_access_right(SIZE_T segment_registers)
 
 PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
 {
-    PVOID PageVA;
     PHYSICAL_ADDRESS l1, l2, l3;
 
     l1.QuadPart = 0;
     l2.QuadPart = -1;
     l3.QuadPart = 0x200000;
 
-    PageVA = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, l1, l2, l3, MmCached);
+    PVOID PageVA = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, l1, l2, l3, MmCached);
     ASSERT(PageVA);
     if (PageVA) {
         RtlZeroMemory(PageVA, PAGE_SIZE);
@@ -120,12 +114,7 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     PHYSICAL_ADDRESS IOBitmapBPA = MmAllocateContiguousPages();
     PHYSICAL_ADDRESS MSRBitmapPA = MmAllocateContiguousPages();
 
-    size_t x = 0;
-    //unsigned char r = 0;
-
-    VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
-    VmxSecondaryProcessorBasedControls vm_procctl2;
-    VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {0};
+    //unsigned char r = 0;     
 
     __sidt(&idtr.Limit);
 
@@ -137,19 +126,23 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
     // In order for our choice of supporting RDTSCP and XSAVE/RESTORES above to actually mean something, we have to request secondary controls.
     // We also want to activate the MSR bitmap in order to keep them from being caught.
+    VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {0};
     vmCpuCtlRequested.Fields.UseMSRBitmaps = 0;//这个要处理，否者开启后，卸载会蓝屏。
     vmCpuCtlRequested.Fields.ActivateSecondaryControl = TRUE;
     vmCpuCtlRequested.Fields.UseTSCOffseting = 0;
     vmCpuCtlRequested.Fields.RDTSCExiting = TRUE;//对RDTSC指令的处理，WIN 10上必须支持。
     vmCpuCtlRequested.Fields.CR3LoadExiting = 0;// VPID caches must be invalidated on CR3 change
-    x = VmxAdjustControls(vmCpuCtlRequested.All, 0x48E);
+    size_t x = VmxAdjustControls(vmCpuCtlRequested.All, 0x48E);
     __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, x);
 
+    VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
     vm_procctl2_requested.fields.enable_ept = 0;
     vm_procctl2_requested.fields.descriptor_table_exiting = 0;
     vm_procctl2_requested.fields.enable_rdtscp = 1;  // for Win10
     vm_procctl2_requested.fields.enable_vpid = 0;
     vm_procctl2_requested.fields.enable_xsaves_xstors = 0;  // for Win10
+
+    VmxSecondaryProcessorBasedControls vm_procctl2;
     vm_procctl2.all = VmxAdjustControls(vm_procctl2_requested.all, 0x48B);
     __vmx_vmwrite(SECONDARY_VM_EXEC_CONTROL, vm_procctl2.all);
 
@@ -253,11 +246,9 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
 
 VOID set_cr4()
-{
-    unsigned __int64 cr4 = 0;
-
-    //设置CR4的一个位。
-    cr4 = __readcr4();
+//设置CR4的一个位。
+{    
+    unsigned __int64 cr4 = __readcr4();
 
     //VMX-Enable Bit (bit 13 of CR4) — Enables VMX operation when set
     cr4 = cr4 | 0x2000;//1>>13
@@ -271,12 +262,7 @@ VOID set_cr4()
 NTSTATUS HvmSubvertCpu()
 {
     PHYSICAL_ADDRESS PhyAddr;
-    unsigned char rc = 0;
-    SIZE_T HostRsp;
     SIZE_T GuestRsp = (size_t)_AddressOfReturnAddress() + sizeof(void *);//即父函数中的RSP的值。_ReturnAddress().
-    PVOID Vmcs;
-    PVOID VmxonR;
-    PVOID Stack;
     PHYSICAL_ADDRESS lowest_acceptable_address = {0};
     PHYSICAL_ADDRESS boundary_address_multiple = {0};
 
@@ -288,21 +274,21 @@ NTSTATUS HvmSubvertCpu()
     */
     PhyAddr.QuadPart = -1;//MmAllocateNonCachedMemory 
     //VmxonR = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
-    VmxonR = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
+    PVOID VmxonR = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
     if (VmxonR == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(VmxonR, PAGE_SIZE);
 
     //Vmcs  = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
-    Vmcs = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
+    PVOID Vmcs = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
     if (Vmcs == NULL) {
         MmFreeContiguousMemory(VmxonR);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(Vmcs, PAGE_SIZE);
 
-    Stack = ExAllocatePool2(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
+    PVOID Stack = ExAllocatePool2(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
     if (Stack == NULL) {
         if (Vmcs) {
             MmFreeContiguousMemory(Vmcs);
@@ -320,13 +306,13 @@ NTSTATUS HvmSubvertCpu()
     *(SIZE_T *)Vmcs = (__readmsr(MSR_IA32_VMX_BASIC) & 0xffffffff);
 
     PhyAddr = MmGetPhysicalAddress(VmxonR);
-    rc = __vmx_on((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
+    unsigned char rc = __vmx_on((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
 
     PhyAddr = MmGetPhysicalAddress(Vmcs);
     rc = __vmx_vmclear((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
     rc = __vmx_vmptrld((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
 
-    HostRsp = (SIZE_T)Stack + 2 * PAGE_SIZE - sizeof(void *);
+    SIZE_T HostRsp = (SIZE_T)Stack + 2 * PAGE_SIZE - sizeof(void *);
     SetVMCS(HostRsp, GuestRsp);
 
     rc = __vmx_vmlaunch();
@@ -365,12 +351,9 @@ https://msdn.microsoft.com/en-us/library/h65k4tze.aspx
 23.7 ENABLING AND ENTERING VMX OPERATION
 */
 {
-    SSIZE_T FeatureControlMsr = 0; // 重命名以避免与宏冲突
-    unsigned char b = 0;
+    SSIZE_T FeatureControlMsr = __readmsr(IA32_FEATURE_CONTROL);
 
-    FeatureControlMsr = __readmsr(IA32_FEATURE_CONTROL);
-
-    b = _bittest64(&FeatureControlMsr, 0);
+    unsigned char b = _bittest64(&FeatureControlMsr, 0);
     if (0 == b) {
         return FALSE;//If this bit is clear, VMXON causes a general-protection exception.
     }
@@ -399,15 +382,13 @@ System software can determine whether a processor supports VMX operation using C
 If CPUID.1:ECX.VMX[bit 5] = 1, then VMX operation is supported.
 */
 {
-    BOOL B = FALSE;
     int CPUInfo[4] = {-1};
-    int ecx = 0;
 
     __cpuid(CPUInfo, 1);
 
-    ecx = CPUInfo[2];
+    int ecx = CPUInfo[2];
 
-    B = _bittest((LONG const *)&ecx, 5);
+    BOOL B = _bittest((LONG const *)&ecx, 5);
 
     return B;
 }
@@ -418,13 +399,12 @@ BOOL is_support_intel()
     BOOL B = FALSE;
     char CPUString[0x20];
     int CPUInfo[4] = {-1};
-    unsigned    nIds;
 
     // __cpuid with an InfoType argument of 0 returns the number of valid Ids in CPUInfo[0] and the CPU identification string in the other three array elements.
     // The CPU identification string is not in linear order. 
     // The code below arranges the information in a human readable form.
     __cpuid(CPUInfo, 0);
-    nIds = CPUInfo[0];
+    //unsigned nIds = CPUInfo[0];
     memset(CPUString, 0, sizeof(CPUString));
     *((int *)CPUString) = CPUInfo[1];
     *((int *)(CPUString + 4)) = CPUInfo[3];
@@ -447,17 +427,13 @@ If a software procedure can set and clear this flag, the processor executing the
 This instruction operates the same in non-64-bit modes and 64-bit mode.
 */
 {
-    SIZE_T original;
-    SIZE_T flipped;
-    SIZE_T readback;
-
-    original = __readeflags(); //读取
+    SIZE_T original = __readeflags(); //读取
 
     // 尝试翻转第 21 位
-    flipped = original ^ 0x200000;
+    SIZE_T flipped = original ^ 0x200000;
 
     __writeeflags(flipped);
-    readback = __readeflags();
+    SIZE_T readback = __readeflags();
     __writeeflags(original); // 恢复
 
     // 检查第 21 位是否已改变
