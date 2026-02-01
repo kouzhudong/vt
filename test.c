@@ -91,10 +91,9 @@ PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
 
     l1.QuadPart = 0;
     l2.QuadPart = -1;
-    l3.QuadPart = 0x200000;
+    l3.QuadPart = 0x200000; // Alignment / Boundary
 
-    PVOID PageVA = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, l1, l2, l3, MmCached);
-    ASSERT(PageVA);
+    PVOID PageVA = MmAllocateContiguousNodeMemory(PAGE_SIZE, l1, l2, l3, PAGE_READWRITE, MM_ANY_NODE_OK);
     if (PageVA) {
         RtlZeroMemory(PageVA, PAGE_SIZE);
         return MmGetPhysicalAddress(PageVA);
@@ -127,7 +126,8 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     // In order for our choice of supporting RDTSCP and XSAVE/RESTORES above to actually mean something, we have to request secondary controls.
     // We also want to activate the MSR bitmap in order to keep them from being caught.
     VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {0};
-    vmCpuCtlRequested.Fields.UseMSRBitmaps = 0;//这个要处理，否者开启后，卸载会蓝屏。
+    vmCpuCtlRequested.Fields.UseMSRBitmaps = 1;// Windows 11 改进：必须启用 MSR Bitmap 以避免海量 VMExit 导致的系统卡死/蓝屏。
+                                               // 我们分配了全 0 的 Bitmap，意味着不拦截任何 MSR，既安全又高效。
     vmCpuCtlRequested.Fields.ActivateSecondaryControl = TRUE;
     vmCpuCtlRequested.Fields.UseTSCOffseting = 0;
     vmCpuCtlRequested.Fields.RDTSCExiting = TRUE;//对RDTSC指令的处理，WIN 10上必须支持。
@@ -136,11 +136,19 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, x);
 
     VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
-    vm_procctl2_requested.fields.enable_ept = 0;
+    vm_procctl2_requested.fields.enable_ept = 0; // 如果不需要 EPT 隐身/HOOK，关闭 EPT 是最简单的迁移方式。
     vm_procctl2_requested.fields.descriptor_table_exiting = 0;
-    vm_procctl2_requested.fields.enable_rdtscp = 1;  // for Win10
-    vm_procctl2_requested.fields.enable_vpid = 0;
-    vm_procctl2_requested.fields.enable_xsaves_xstors = 0;  // for Win10
+    vm_procctl2_requested.fields.enable_rdtscp = 1;  // for Win10+
+    vm_procctl2_requested.fields.enable_vpid = 0;    // 暂时关闭 VPID 简化逻辑，虽然开启有助于性能，但需要正确管理 VPID 字段。
+    
+    // Windows 11 关键改进：
+    // 必须启用 XSAVES/XRSTORS 支持。Win11 依赖这些指令进行上下文切换。
+    // 如果硬件支持但 VMCS 中禁用，系统会触发异常。
+    // VmxAdjustControls 会自动处理硬件不支持的情况（通过 & HighPart）。
+    vm_procctl2_requested.fields.enable_xsaves_xstors = 1; 
+    
+    // Windows 11 也建议支持 INVPCID
+    vm_procctl2_requested.fields.enable_invpcid = 1;
 
     VmxSecondaryProcessorBasedControls vm_procctl2;
     vm_procctl2.all = VmxAdjustControls(vm_procctl2_requested.all, 0x48B);
