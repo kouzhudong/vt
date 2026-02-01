@@ -3,7 +3,7 @@
 
 NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Register, ULONG64 Value)
 {
-    ULONG uCodeLength;
+    ULONG uCodeLength = 0;
 
     if (!pCode || !pGeneratedCodeLength)
         return STATUS_INVALID_PARAMETER;
@@ -41,6 +41,9 @@ NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Regi
         pCode[1] = 0x22;
         pCode[2] = 0xc0 | (UCHAR)((Register & REG_MASK) << 3);
         uCodeLength += 3;// *pGeneratedCodeLength has already been adjusted to the length of the "mov rax"
+        break;
+    default:
+        return STATUS_NOT_SUPPORTED;
     }
 
     if (pGeneratedCodeLength)
@@ -138,7 +141,7 @@ VOID reset_cr4()
     //_bittestandreset, _bittestandreset64
     _bittestandreset64((__int64 *)&cr4, b);
 
-    __writecr4((unsigned int)cr4);
+    __writecr4(cr4);
 }
 
 

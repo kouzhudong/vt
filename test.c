@@ -104,8 +104,14 @@ PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
 
     PageVA = MmAllocateContiguousMemorySpecifyCache (PAGE_SIZE, l1, l2, l3, MmCached);
     ASSERT (PageVA);
-    RtlZeroMemory (PageVA, PAGE_SIZE);
-    return MmGetPhysicalAddress (PageVA);
+    if (PageVA) {
+        RtlZeroMemory(PageVA, PAGE_SIZE);
+        return MmGetPhysicalAddress(PageVA);
+    }
+    else {
+        PHYSICAL_ADDRESS invalid = { 0 };
+        return invalid;
+    }
 }
 
 
@@ -127,8 +133,9 @@ VOID SetVMCS (SIZE_T HostRsp, SIZE_T GuestRsp)
 
     __sidt(&idtr.Limit);
 
-    __vmx_vmwrite (VMCS_LINK_POINTER,      0xffffffff);
-    __vmx_vmwrite (VMCS_LINK_POINTER_HIGH, 0xffffffff);
+    // 在 64 位模式下，该字段是 64 位的。设置为全 1 (-1) 表示不使用 VMCS 链接指针。
+    __vmx_vmwrite (VMCS_LINK_POINTER,      0xffffffffffffffffULL);
+    // __vmx_vmwrite (VMCS_LINK_POINTER_HIGH, 0xffffffff); // 不需要，64位环境不支持 High 字段操作
 
     __vmx_vmwrite (PIN_BASED_VM_EXEC_CONTROL, VmxAdjustControls(0, MSR_IA32_VMX_PINBASED_CTLS));
 
@@ -158,12 +165,10 @@ VOID SetVMCS (SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite (CR0_GUEST_HOST_MASK, X86_CR0_PG);
     __vmx_vmwrite (CR0_READ_SHADOW,     (__readcr4() & X86_CR0_PG) | X86_CR0_PG);
 
-    __vmx_vmwrite (IO_BITMAP_A,      IOBitmapAPA.LowPart);
-    __vmx_vmwrite (IO_BITMAP_A_HIGH, IOBitmapBPA.HighPart);
-    __vmx_vmwrite (IO_BITMAP_B,      IOBitmapBPA.LowPart);
-    __vmx_vmwrite (IO_BITMAP_B_HIGH, IOBitmapBPA.HighPart);
-    __vmx_vmwrite (MSR_BITMAP,       MSRBitmapPA.LowPart);
-    __vmx_vmwrite (MSR_BITMAP_HIGH,  MSRBitmapPA.HighPart);
+    // 64 位模式下，地址字段直接写入 64 位物理地址，无需拆分 High/Low
+    __vmx_vmwrite (IO_BITMAP_A,      IOBitmapAPA.QuadPart);
+    __vmx_vmwrite (IO_BITMAP_B,      IOBitmapBPA.QuadPart);
+    __vmx_vmwrite (MSR_BITMAP,       MSRBitmapPA.QuadPart);
 
     __vmx_vmwrite (EXCEPTION_BITMAP,  0);
 
@@ -219,8 +224,8 @@ VOID SetVMCS (SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite (GUEST_RIP,   (SIZE_T)CmGuestEip);
     __vmx_vmwrite (GUEST_RFLAGS, __getcallerseflags());
 
-    __vmx_vmwrite (GUEST_IA32_DEBUGCTL,      __readmsr(MSR_IA32_DEBUGCTL) & 0xffffffff);
-    __vmx_vmwrite (GUEST_IA32_DEBUGCTL_HIGH, __readmsr (MSR_IA32_DEBUGCTL) >> 32);
+    __vmx_vmwrite (GUEST_IA32_DEBUGCTL,      __readmsr(MSR_IA32_DEBUGCTL));
+    // __vmx_vmwrite (GUEST_IA32_DEBUGCTL_HIGH, __readmsr (MSR_IA32_DEBUGCTL) >> 32); // 64位环境不需要
 
     //////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -296,7 +301,9 @@ NTSTATUS HvmSubvertCpu ()
     ASSERT (Vmcs);
     RtlZeroMemory (Vmcs, PAGE_SIZE);
 
-    Stack  = ExAllocatePoolWithTag (NonPagedPoolNx, 2 * PAGE_SIZE, TAG);ASSERT (Stack); RtlZeroMemory (Stack, 2 * PAGE_SIZE);
+    Stack  = ExAllocatePool2(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
+    ASSERT (Stack); 
+    RtlZeroMemory (Stack, 2 * PAGE_SIZE);
 
     set_cr4();
 
@@ -351,25 +358,25 @@ BOOL is_support_blos()
     23.7 ENABLING AND ENTERING VMX OPERATION
     */
 {
-    SIZE_T MSR_IA32_FEATURE_CONTROL = 0;
+    SIZE_T FeatureControlMsr = 0; // 重命名以避免与宏冲突
     unsigned char b =  0;
 
-    MSR_IA32_FEATURE_CONTROL = __readmsr(IA32_FEATURE_CONTROL);
+    FeatureControlMsr = __readmsr(IA32_FEATURE_CONTROL);
 
-    b = _bittest64(&MSR_IA32_FEATURE_CONTROL, 0);
+    b = _bittest64(&FeatureControlMsr, 0);
     if (0 == b)
     {
         return FALSE;//If this bit is clear, VMXON causes a general-protection exception.
     }
 
-    b = _bittest64(&MSR_IA32_FEATURE_CONTROL, 1);
+    b = _bittest64(&FeatureControlMsr, 1);
     if (0 == b)
     {
         KdPrint(("SMX 下不支持 VMX，不过这也没关系.\r\n"));
         //return FALSE;
     }
 
-    b = _bittest64(&MSR_IA32_FEATURE_CONTROL, 2);
+    b = _bittest64(&FeatureControlMsr, 2);
     if (0 == b)
     {
         return FALSE;
@@ -437,38 +444,26 @@ If a software procedure can set and clear this flag, the processor executing the
 This instruction operates the same in non-64-bit modes and 64-bit mode.
 */
 {
-    BOOL B = FALSE;
     SIZE_T original;
-    SIZE_T result;
-    SIZE_T temp;
+    SIZE_T flipped;
+    SIZE_T readback;
 
     original = __readeflags(); //读取
-    if (_bittest64(&original, 21) == 0)
+    
+    // 尝试翻转第 21 位
+    flipped = original ^ 0x200000;
+    
+    __writeeflags(flipped);
+    readback = __readeflags();
+    __writeeflags(original); // 恢复
+
+    // 检查第 21 位是否已改变
+    if ((readback ^ original) & 0x200000)
     {
-        temp = original;
-        _bittestandset64(&temp, 21);//设置这一位为1. 另一个办法是和0x200000进行或操作。
-
-        __writeeflags(temp);//写入测试。
-
-        result = __readeflags();//读取结果。
-
-        __writeeflags(original);//恢复。
-
-        //判断
-        if (_bittest64(&result, 21) == 0) {
-            B = FALSE;
-        }
-        else {
-            B = TRUE;
-        }
-    }
-    else
-    {
-        ASSERT(_bittest64(&original, 21) == 0);//断言这个位为0.
-        //其实，要做，和上面的类似。
+        return TRUE;
     }
 
-    return B;
+    return FALSE;
 }
 
 
