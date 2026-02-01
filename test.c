@@ -288,7 +288,7 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Vmcs, PAGE_SIZE);
 
-    PVOID Stack = ExAllocatePool2(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
+    PVOID Stack = ExAllocatePoolWithTag(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);//ExAllocatePool2ÈÝÒ×Ê§°Ü¡£
     if (Stack == NULL) {
         if (Vmcs) {
             MmFreeContiguousMemory(Vmcs);
