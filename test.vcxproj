@@ -26,6 +26,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{03B7289B-6AE6-4FAB-B1F5-48DFD8CA38BD}</ProjectGuid>
     <RootNamespace>$(MSBuildProjectName)</RootNamespace>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Win8.1 Debug|x64'">
     <TargetVersion>Windows10</TargetVersion>
@@ -43,7 +44,19 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win8.1 Debug|x64'">
     <EnableInf2cat>false</EnableInf2cat>
     <DriverCatalog_Enable>false</DriverCatalog_Enable>
+    <RunCodeAnalysis>true</RunCodeAnalysis>
   </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win8.1 Debug|x64'">
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win8.1 Debug|x64'">
+    <ClCompile>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <WarningLevel>Level4</WarningLevel>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <!-- The WrappedTaskItems label is used by the conversion tool to identify the location where items 
         associated with wrapped tasks will reside.-->
   <ItemGroup Label="WrappedTaskItems" />

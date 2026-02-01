@@ -8,8 +8,7 @@ NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Regi
     if (!pCode || !pGeneratedCodeLength)
         return STATUS_INVALID_PARAMETER;
 
-    switch (Register & ~REG_MASK)
-    {
+    switch (Register & ~REG_MASK) {
     case REG_GP:
         pCode[0] = 0x48;
         pCode[1] = 0xb8 | (UCHAR)(Register & REG_MASK);
@@ -29,8 +28,7 @@ NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Regi
         pCode += uCodeLength;
         uCodeLength = 0;
 
-        if (Register == (REG_CR8))
-        {
+        if (Register == (REG_CR8)) {
             pCode[0] = 0x44;
             uCodeLength = 1;
             pCode++;
@@ -154,7 +152,7 @@ NTSTATUS VmxShutdown(PGUEST_REGS GuestRegs)
     __vmx_off();
     reset_cr4();
 
-    ((VOID(*)()) &Trampoline) ();
+    ((VOID(*)()) & Trampoline) ();
     return STATUS_SUCCESS; // never returns
 }
 
@@ -171,8 +169,7 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
     ULONG_PTR GuestEIP;
     ULONG_PTR inst_len;
 
-    if (!GuestRegs)
-    {
+    if (!GuestRegs) {
         return;
     }
 
@@ -180,163 +177,153 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
     __vmx_vmread(GUEST_RIP, &GuestEIP);
     __vmx_vmread(VM_EXIT_INSTRUCTION_LEN, &inst_len);
 
-    switch (ExitReason)
+    switch (ExitReason) {
+    case EXIT_REASON_CPUID://CPU-Z总是有些信息显示不出来。不过兼容自己写的几个程序。
     {
-        case EXIT_REASON_CPUID://CPU-Z总是有些信息显示不出来。不过兼容自己写的几个程序。
-        {
-            int CPUInfo[4] = { -1 };
+        int CPUInfo[4] = {-1};
 
-            __cpuidex(CPUInfo, (int)GuestRegs->rax, (int)GuestRegs->rcx);
-            //__cpuid(CPUInfo, (int)GuestRegs->rax);
-            if (GuestRegs->rax == 0)
-            {//返回MadeByCorrey
-                GuestRegs->rax = CPUInfo[0];
-                GuestRegs->rbx = 'edaM';
-                GuestRegs->rcx = 'yerr';
-                GuestRegs->rdx = 'oCyB';
-                //GuestRegs->rbx = CPUInfo[1];
-                //GuestRegs->rcx = CPUInfo[3];
-                //GuestRegs->rdx = CPUInfo[2];
-            }
-            else
-            {
-                GuestRegs->rax = CPUInfo[0];
-                GuestRegs->rbx = CPUInfo[1];
-                GuestRegs->rcx = CPUInfo[2];
-                GuestRegs->rdx = CPUInfo[3];
-            }
+        __cpuidex(CPUInfo, (int)GuestRegs->rax, (int)GuestRegs->rcx);
+        //__cpuid(CPUInfo, (int)GuestRegs->rax);
+        if (GuestRegs->rax == 0) {//返回MadeByCorrey
+            GuestRegs->rax = CPUInfo[0];
+            GuestRegs->rbx = 'edaM';
+            GuestRegs->rcx = 'yerr';
+            GuestRegs->rdx = 'oCyB';
+            //GuestRegs->rbx = CPUInfo[1];
+            //GuestRegs->rcx = CPUInfo[3];
+            //GuestRegs->rdx = CPUInfo[2];
+        } else {
+            GuestRegs->rax = CPUInfo[0];
+            GuestRegs->rbx = CPUInfo[1];
+            GuestRegs->rcx = CPUInfo[2];
+            GuestRegs->rdx = CPUInfo[3];
         }
-        break;
-        case EXIT_REASON_VMCALL:
-        {
-            ULONG32 HypercallNumber = (ULONG32)(GuestRegs->rcx & 0xffff);
-            switch (HypercallNumber)
-            {
-            case NBP_HYPERCALL_UNLOAD:
-                GuestRegs->rcx = NBP_MAGIC;
-                GuestRegs->rdx = 0;
-                VmxShutdown(GuestRegs);// disable virtualization, resume guest, don't setup time bomb
-                break;// never returns
-            default:
-                break;
-            }
-
+    }
+    break;
+    case EXIT_REASON_VMCALL:
+    {
+        ULONG32 HypercallNumber = (ULONG32)(GuestRegs->rcx & 0xffff);
+        switch (HypercallNumber) {
+        case NBP_HYPERCALL_UNLOAD:
             GuestRegs->rcx = NBP_MAGIC;
             GuestRegs->rdx = 0;
-        }
-        break;
-        case EXIT_REASON_CR_ACCESS:
-        {
-            ULONG32 exit_qualification = (ULONG32)VmxRead(EXIT_QUALIFICATION);
-            ULONG32 gp = (exit_qualification & CONTROL_REG_ACCESS_REG) >> 8;
-            ULONG32 cr = exit_qualification & CONTROL_REG_ACCESS_NUM;
-
-            switch (exit_qualification & CONTROL_REG_ACCESS_TYPE)
-            {
-            case TYPE_MOV_TO_CR:
-                if (cr == 3)
-                {
-                    __vmx_vmwrite(GUEST_CR3, *((PULONG64)GuestRegs + gp));
-                }
-                break;
-            case TYPE_MOV_FROM_CR:
-                if (cr == 3)
-                {
-                    __vmx_vmread(GUEST_CR3, (PULONG64)GuestRegs + gp);
-                }
-                break;
-            }
-        }
-        break;
-        case EXIT_REASON_MSR_READ:
-        {
-            //size_t FieldValue = 0;
-            LARGE_INTEGER MsrValue;
-            ULONG32 rcx = (ULONG32)GuestRegs->rcx;
-            switch (rcx)
-            {
-            case MSR_IA32_SYSENTER_CS:
-                MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_CS);//这几个改为__vmx_vmread有问题。
-                break;
-            case MSR_IA32_SYSENTER_ESP:
-                MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_ESP);
-                break;
-            case MSR_IA32_SYSENTER_EIP:
-                MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_EIP);
-                break;
-            case MSR_GS_BASE:
-                MsrValue.QuadPart = VmxRead(GUEST_GS_BASE);
-                break;
-            case MSR_FS_BASE:
-                MsrValue.QuadPart = VmxRead(GUEST_FS_BASE);
-                break;
-            default:
-                MsrValue.QuadPart = __readmsr(rcx);
-            }
-
-            GuestRegs->rax = MsrValue.LowPart;
-            GuestRegs->rdx = MsrValue.HighPart;
-        }
-        break;
-        case EXIT_REASON_MSR_WRITE:
-        {
-            LARGE_INTEGER MsrValue;
-            ULONG32 rcx = (ULONG32)GuestRegs->rcx;
-
-            MsrValue.LowPart = (ULONG32)GuestRegs->rax;
-            MsrValue.HighPart = (ULONG32)GuestRegs->rdx;
-
-            switch (rcx)
-            {
-            case MSR_IA32_SYSENTER_CS:
-                __vmx_vmwrite(GUEST_SYSENTER_CS, MsrValue.QuadPart);
-                break;
-            case MSR_IA32_SYSENTER_ESP:
-                __vmx_vmwrite(GUEST_SYSENTER_ESP, MsrValue.QuadPart);
-                break;
-            case MSR_IA32_SYSENTER_EIP:
-                __vmx_vmwrite(GUEST_SYSENTER_EIP, MsrValue.QuadPart);
-                break;
-            case MSR_GS_BASE:
-                __vmx_vmwrite(GUEST_GS_BASE, MsrValue.QuadPart);
-                break;
-            case MSR_FS_BASE:
-                __vmx_vmwrite(GUEST_FS_BASE, MsrValue.QuadPart);
-                break;
-            default:
-                __writemsr(rcx, MsrValue.QuadPart);
-            }
-        }
-        break;
-        case EXIT_REASON_RDTSC:
-        {
-            unsigned __int64 tick = __rdtsc();
-
-            GuestRegs->rax = tick & 0xffffffff;
-            GuestRegs->rdx = (tick & 0xffffffff00000000) / 0x100000000;
-        }
-        break;
-        case 51://EXIT_REASON_RDTSCP
-        {
-            unsigned int Aux;
-            unsigned __int64 tick = __rdtscp(&Aux);
-
-            GuestRegs->rax = tick & 0xffffffff;
-            GuestRegs->rdx = (tick & 0xffffffff00000000) / 0x100000000;
-            GuestRegs->rcx = Aux;
-        }
-        break;
-        //(ExitReason >= EXIT_REASON_VMCLEAR && ExitReason <= EXIT_REASON_VMXON)
-        //{
-        //    __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & (~0x8d5) | 0x1);
-        //}
+            VmxShutdown(GuestRegs);// disable virtualization, resume guest, don't setup time bomb
+            break;// never returns
         default:
-        {
-            //KdPrint (("VmExitHandler(): failed for exitcode 0x%llX\n", ExitReason));
-            ULONG64 x = ExitReason;
-            x = 0;
+            break;
         }
-        break;
+
+        GuestRegs->rcx = NBP_MAGIC;
+        GuestRegs->rdx = 0;
+    }
+    break;
+    case EXIT_REASON_CR_ACCESS:
+    {
+        ULONG32 exit_qualification = (ULONG32)VmxRead(EXIT_QUALIFICATION);
+        ULONG32 gp = (exit_qualification & CONTROL_REG_ACCESS_REG) >> 8;
+        ULONG32 cr = exit_qualification & CONTROL_REG_ACCESS_NUM;
+
+        switch (exit_qualification & CONTROL_REG_ACCESS_TYPE) {
+        case TYPE_MOV_TO_CR:
+            if (cr == 3) {
+                __vmx_vmwrite(GUEST_CR3, *((PULONG64)GuestRegs + gp));
+            }
+            break;
+        case TYPE_MOV_FROM_CR:
+            if (cr == 3) {
+                __vmx_vmread(GUEST_CR3, (PULONG64)GuestRegs + gp);
+            }
+            break;
+        }
+    }
+    break;
+    case EXIT_REASON_MSR_READ:
+    {
+        //size_t FieldValue = 0;
+        LARGE_INTEGER MsrValue;
+        ULONG32 rcx = (ULONG32)GuestRegs->rcx;
+        switch (rcx) {
+        case MSR_IA32_SYSENTER_CS:
+            MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_CS);//这几个改为__vmx_vmread有问题。
+            break;
+        case MSR_IA32_SYSENTER_ESP:
+            MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_ESP);
+            break;
+        case MSR_IA32_SYSENTER_EIP:
+            MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_EIP);
+            break;
+        case MSR_GS_BASE:
+            MsrValue.QuadPart = VmxRead(GUEST_GS_BASE);
+            break;
+        case MSR_FS_BASE:
+            MsrValue.QuadPart = VmxRead(GUEST_FS_BASE);
+            break;
+        default:
+            MsrValue.QuadPart = __readmsr(rcx);
+        }
+
+        GuestRegs->rax = MsrValue.LowPart;
+        GuestRegs->rdx = MsrValue.HighPart;
+    }
+    break;
+    case EXIT_REASON_MSR_WRITE:
+    {
+        LARGE_INTEGER MsrValue;
+        ULONG32 rcx = (ULONG32)GuestRegs->rcx;
+
+        MsrValue.LowPart = (ULONG32)GuestRegs->rax;
+        MsrValue.HighPart = (ULONG32)GuestRegs->rdx;
+
+        switch (rcx) {
+        case MSR_IA32_SYSENTER_CS:
+            __vmx_vmwrite(GUEST_SYSENTER_CS, MsrValue.QuadPart);
+            break;
+        case MSR_IA32_SYSENTER_ESP:
+            __vmx_vmwrite(GUEST_SYSENTER_ESP, MsrValue.QuadPart);
+            break;
+        case MSR_IA32_SYSENTER_EIP:
+            __vmx_vmwrite(GUEST_SYSENTER_EIP, MsrValue.QuadPart);
+            break;
+        case MSR_GS_BASE:
+            __vmx_vmwrite(GUEST_GS_BASE, MsrValue.QuadPart);
+            break;
+        case MSR_FS_BASE:
+            __vmx_vmwrite(GUEST_FS_BASE, MsrValue.QuadPart);
+            break;
+        default:
+            __writemsr(rcx, MsrValue.QuadPart);
+        }
+    }
+    break;
+    case EXIT_REASON_RDTSC:
+    {
+        unsigned __int64 tick = __rdtsc();
+
+        GuestRegs->rax = tick & 0xffffffff;
+        GuestRegs->rdx = (tick & 0xffffffff00000000) / 0x100000000;
+    }
+    break;
+    case 51://EXIT_REASON_RDTSCP
+    {
+        unsigned int Aux;
+        unsigned __int64 tick = __rdtscp(&Aux);
+
+        GuestRegs->rax = tick & 0xffffffff;
+        GuestRegs->rdx = (tick & 0xffffffff00000000) / 0x100000000;
+        GuestRegs->rcx = Aux;
+    }
+    break;
+    //(ExitReason >= EXIT_REASON_VMCLEAR && ExitReason <= EXIT_REASON_VMXON)
+    //{
+    //    __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & (~0x8d5) | 0x1);
+    //}
+    default:
+    {
+        //KdPrint (("VmExitHandler(): failed for exitcode 0x%llX\n", ExitReason));
+        ULONG64 x = ExitReason;
+        x = 0;
+    }
+    break;
     }
 
     __vmx_vmwrite(GUEST_RIP, GuestEIP + inst_len);
