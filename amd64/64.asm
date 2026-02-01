@@ -96,16 +96,16 @@ CmSubvert PROC
 	push	r14
 	push	r15
 
-	sub	rsp, 28h        
+	sub	rsp, 20h
 	call	HvmSubvertCpu
 CmSubvert ENDP
 
 
 CmGuestEip PROC
-    call	HvmResumeGuest
-	add	rsp, 28h
+   call	HvmResumeGuest
+add	rsp, 20h
 
-	pop	r15
+pop	r15
 	pop	r14
 	pop	r13
 	pop	r12

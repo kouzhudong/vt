@@ -78,7 +78,7 @@ SIZE_T get_segments_access_right(SIZE_T segment_registers)
 
     access_right = get_access_rights(segment_registers);
     /*
-    估计这个返回的是：Segment Descriptor的高DWORD，但是也排除这个DWORD的高八位（Base 31:24）和低八位（Base 23:16）。
+    估计这个返回的是：Segment Descriptor的高DWORD，但是也排除这个 DWORD的高八位（Base 31:24）和低八位（Base 23:16）。
     */
 
     /*
