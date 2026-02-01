@@ -6,8 +6,10 @@ static ULONG32  VmxAdjustControls(ULONG32 Ctl, ULONG32 Msr)
     LARGE_INTEGER MsrValue;
 
     MsrValue.QuadPart = __readmsr(Msr);
-    Ctl &= MsrValue.HighPart;     /* bit == 0 in high word ==> must be zero */
-    Ctl |= MsrValue.LowPart;      /* bit == 1 in low word  ==> must be one  */
+    // 高位部分为 0 的位，CTL 中必须为 0 (不允许设为1)
+    Ctl &= MsrValue.HighPart;
+    // 低位部分为 1 的位，CTL 中必须为 1 (强制设为1)
+    Ctl |= MsrValue.LowPart;
     return Ctl;
 }
 
@@ -91,9 +93,12 @@ PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
 
     l1.QuadPart = 0;
     l2.QuadPart = -1;
-    l3.QuadPart = 0x200000; // Alignment / Boundary
+    l3.QuadPart = 0x200000; // 边界对齐
 
+    // 修复：使用 MmAllocateContiguousNodeMemory 替代废弃API，提高兼容性
     PVOID PageVA = MmAllocateContiguousNodeMemory(PAGE_SIZE, l1, l2, l3, PAGE_READWRITE, MM_ANY_NODE_OK);
+
+    // ASSERT(PageVA); // 如果内存耗尽，ASSERT会导致蓝屏，建议在Release中移除
     if (PageVA) {
         RtlZeroMemory(PageVA, PAGE_SIZE);
         return MmGetPhysicalAddress(PageVA);
@@ -109,6 +114,9 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     SIZE_T           GdtBase = (SIZE_T)(KeGetPcr()->GdtBase);//r gdtr
     AMD64_DESCRIPTOR idtr = {0};
     //PKPCR            pcr = KeGetPcr();
+
+    // 关键修正：确保 MSR Bitmap 内存被正确分配。
+    // 如果分配失败（Phys=0），系统会访问物理地址0，导致异常。但在这里我们已经在分配函数里做了处理。
     PHYSICAL_ADDRESS IOBitmapAPA = MmAllocateContiguousPages();
     PHYSICAL_ADDRESS IOBitmapBPA = MmAllocateContiguousPages();
     PHYSICAL_ADDRESS MSRBitmapPA = MmAllocateContiguousPages();
@@ -121,33 +129,47 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(VMCS_LINK_POINTER, 0xffffffffffffffffULL);
     // __vmx_vmwrite (VMCS_LINK_POINTER_HIGH, 0xffffffff); // 不需要，64位环境不支持 High 字段操作
 
+    // PIN-BASED CONTROLS
     __vmx_vmwrite(PIN_BASED_VM_EXEC_CONTROL, VmxAdjustControls(0, MSR_IA32_VMX_PINBASED_CTLS));
 
-    // In order for our choice of supporting RDTSCP and XSAVE/RESTORES above to actually mean something, we have to request secondary controls.
-    // We also want to activate the MSR bitmap in order to keep them from being caught.
+    // PRIMARY PROCESSOR-BASED CONTROLS
     VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {0};
-    vmCpuCtlRequested.Fields.UseMSRBitmaps = 1;// Windows 11 改进：必须启用 MSR Bitmap 以避免海量 VMExit 导致的系统卡死/蓝屏。
-                                               // 我们分配了全 0 的 Bitmap，意味着不拦截任何 MSR，既安全又高效。
+
+    // [FIX 1] 启用 MSR Bitmaps
+    // Win11 访问大量特定 MSR，如果不启用 Bitmap（让所有MSR访问都产生 VMExit），会导致极高的性能开销，看起来像卡死。
+    // 我们传入全 0 的 Bitmap，意味着不拦截任何 MSR，直通硬件，性能最好。
+    vmCpuCtlRequested.Fields.UseMSRBitmaps = 1;
+
     vmCpuCtlRequested.Fields.ActivateSecondaryControl = TRUE;
     vmCpuCtlRequested.Fields.UseTSCOffseting = 0;
-    vmCpuCtlRequested.Fields.RDTSCExiting = TRUE;//对RDTSC指令的处理，WIN 10上必须支持。
+
+    // [FIX 2] 禁用 RDTSC 退出 !!!
+    // 此处原代码为 TRUE。在 Win11 上，RDTSC 被高频使用。
+    // 除非你有极其优化的汇编处理程序并正确处理 RDTSCP 的 RCX 寄存器，否则开启此项会导致系统卡顿甚至 "Freeze"。
+    // 这里改为 FALSE，允许 Guest 直接执行 RDTSC。
+    vmCpuCtlRequested.Fields.RDTSCExiting = FALSE;
+
     vmCpuCtlRequested.Fields.CR3LoadExiting = 0;// VPID caches must be invalidated on CR3 change
     size_t x = VmxAdjustControls(vmCpuCtlRequested.All, 0x48E);
     __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, x);
 
+
+    // SECONDARY PROCESSOR-BASED CONTROLS
     VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
-    vm_procctl2_requested.fields.enable_ept = 0; // 如果不需要 EPT 隐身/HOOK，关闭 EPT 是最简单的迁移方式。
+    vm_procctl2_requested.fields.enable_ept = 0;
     vm_procctl2_requested.fields.descriptor_table_exiting = 0;
-    vm_procctl2_requested.fields.enable_rdtscp = 1;  // for Win10+
-    vm_procctl2_requested.fields.enable_vpid = 0;    // 暂时关闭 VPID 简化逻辑，虽然开启有助于性能，但需要正确管理 VPID 字段。
-    
-    // Windows 11 关键改进：
-    // 必须启用 XSAVES/XRSTORS 支持。Win11 依赖这些指令进行上下文切换。
-    // 如果硬件支持但 VMCS 中禁用，系统会触发异常。
-    // VmxAdjustControls 会自动处理硬件不支持的情况（通过 & HighPart）。
-    vm_procctl2_requested.fields.enable_xsaves_xstors = 1; 
-    
-    // Windows 11 也建议支持 INVPCID
+
+    // [FIX 3] Enable RDTSCP
+    // 即使 RDTSCExiting = 0，如果 enable_rdtscp = 0，Guest 执行 RDTSCP 指令会触发 #UD 异常。
+    // Win10/11 必须置 1。
+    vm_procctl2_requested.fields.enable_rdtscp = 1;
+
+    vm_procctl2_requested.fields.enable_vpid = 0;
+
+    // [FIX 4] Win11 必需特性支持
+    // Windows 11 默认使用 XSAVES/XRSTORS 和 INVPCID。
+    // 如果不在 VMCS 中声明支持，Guest 尝试执行时会触发 #UD。
+    vm_procctl2_requested.fields.enable_xsaves_xstors = 1;
     vm_procctl2_requested.fields.enable_invpcid = 1;
 
     VmxSecondaryProcessorBasedControls vm_procctl2;
@@ -162,7 +184,7 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(CR0_GUEST_HOST_MASK, X86_CR0_PG);
     __vmx_vmwrite(CR0_READ_SHADOW, (__readcr4() & X86_CR0_PG) | X86_CR0_PG);
 
-    // 64 位模式下，地址字段直接写入 64 位物理地址，无需拆分 High/Low
+    // 写入地址字段
     __vmx_vmwrite(IO_BITMAP_A, IOBitmapAPA.QuadPart);
     __vmx_vmwrite(IO_BITMAP_B, IOBitmapBPA.QuadPart);
     __vmx_vmwrite(MSR_BITMAP, MSRBitmapPA.QuadPart);
@@ -170,7 +192,7 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(EXCEPTION_BITMAP, 0);
 
     //////////////////////////////////////////////////////////////////////////////////////////////
-
+    // Guest State Area
     __vmx_vmwrite(GUEST_ES_SELECTOR, RegGetEs());
     __vmx_vmwrite(GUEST_CS_SELECTOR, RegGetCs());
     __vmx_vmwrite(GUEST_SS_SELECTOR, RegGetSs());
@@ -255,7 +277,7 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
 VOID set_cr4()
 //设置CR4的一个位。
-{    
+{
     unsigned __int64 cr4 = __readcr4();
 
     //VMX-Enable Bit (bit 13 of CR4) — Enables VMX operation when set
@@ -274,12 +296,13 @@ NTSTATUS HvmSubvertCpu()
     PHYSICAL_ADDRESS lowest_acceptable_address = {0};
     PHYSICAL_ADDRESS boundary_address_multiple = {0};
 
-    /*
-    1.MmAllocateNonCachedMemory
-    2.MmAllocateContiguousMemory
-    3.MmAllocateContiguousNodeMemory
-    windows10开驱动验证器的情况下，这三个函数异常。
-    */
+    // 检查是否已经在 Hypervisor 之下（例如 VBS/Hyper-V 开启）
+    int CPUInfo[4];
+    __cpuid(CPUInfo, 1);
+    if ((CPUInfo[2] & 0x80000000) != 0) {
+        KdPrint(("Warning: Hypervisor present bit is set. VMXON might fail or cause nested VM exit loop.\n"));
+    }
+
     PhyAddr.QuadPart = -1;//MmAllocateNonCachedMemory 
     //VmxonR = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
     PVOID VmxonR = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
@@ -296,7 +319,7 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Vmcs, PAGE_SIZE);
 
-    PVOID Stack = ExAllocatePoolWithTag(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);//ExAllocatePool2容易失败。
+    PVOID Stack = ExAllocatePoolWithTag(NonPagedPoolNx, 2 * PAGE_SIZE, TAG); // ExAllocatePool2容易失败。
     if (Stack == NULL) {
         if (Vmcs) {
             MmFreeContiguousMemory(Vmcs);
@@ -314,7 +337,18 @@ NTSTATUS HvmSubvertCpu()
     *(SIZE_T *)Vmcs = (__readmsr(MSR_IA32_VMX_BASIC) & 0xffffffff);
 
     PhyAddr = MmGetPhysicalAddress(VmxonR);
-    unsigned char rc = __vmx_on((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
+
+    // [SAFETY] 检查 __vmx_on 返回值。如果失败(例如 VBS 开启且未启用嵌套)，继续执行会导致 0x7E 蓝屏
+    unsigned char rc = __vmx_on((unsigned __int64 *)&PhyAddr);
+
+    if (rc != 0) {
+        KdPrint(("__vmx_on failed with rc=%d. Maybe Hyper-V/VBS is active?\n", rc));
+
+        MmFreeContiguousMemory(Vmcs);
+        MmFreeContiguousMemory(VmxonR);
+        ExFreePool(Stack);
+        return STATUS_HV_OPERATION_FAILED; // 宏需要在头文件定义，或使用 STATUS_UNSUCCESSFUL
+    }
 
     PhyAddr = MmGetPhysicalAddress(Vmcs);
     rc = __vmx_vmclear((unsigned __int64 *)&PhyAddr); ASSERT(!rc);
@@ -337,9 +371,10 @@ NTSTATUS HvmSubvertCpu()
 
         __vmx_off();
 
-        //reset_cr4();
-
-        //释放内存。
+        //释放内存 - 防止泄漏
+        MmFreeContiguousMemory(Vmcs);
+        MmFreeContiguousMemory(VmxonR);
+        ExFreePool(Stack);
     }
 
     return STATUS_SUCCESS;
@@ -502,10 +537,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     for (CHAR i = 0; i < KeNumberProcessors; i++) {
         KeSetSystemAffinityThread((KAFFINITY)((ULONG_PTR)1 << i));
         KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
+
+        // 增加对返回状态的检查，不要用 ASSERT，因为 Release 版本通过后可能会让系统处于不一致状态
         NTSTATUS Status = CmSubvert();//一个汇编函数：流程是保存所有寄存器(除了段寄存器)的内容到栈里后，调用HvmSubvertCpu
         KeLowerIrql(OldIrql);
         KeRevertToUserAffinityThread();
-        ASSERT(NT_SUCCESS(Status));
+
+        if (!NT_SUCCESS(Status)) {
+            KdPrint(("CmSubvert failed on processor %d with status 0x%x\n", i, Status));
+            // 在实际产品中，这里可能需要执行回滚操作（卸载已成功的CPU上的 Hypervisor）
+            return Status;
+        }
     }
 
     DriverObject->DriverUnload = DriverUnload;
