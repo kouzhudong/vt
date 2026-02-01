@@ -289,16 +289,29 @@ NTSTATUS HvmSubvertCpu()
     PhyAddr.QuadPart = -1;//MmAllocateNonCachedMemory 
     //VmxonR = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
     VmxonR = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
-    ASSERT(VmxonR);
+    if (VmxonR == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(VmxonR, PAGE_SIZE);
 
     //Vmcs  = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
     Vmcs = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
-    ASSERT(Vmcs);
+    if (Vmcs == NULL) {
+        MmFreeContiguousMemory(VmxonR);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(Vmcs, PAGE_SIZE);
 
     Stack = ExAllocatePool2(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
-    ASSERT(Stack);
+    if (Stack == NULL) {
+        if (Vmcs) {
+            MmFreeContiguousMemory(Vmcs);
+        }
+        if (VmxonR) {
+            MmFreeContiguousMemory(VmxonR);
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(Stack, 2 * PAGE_SIZE);
 
     set_cr4();
