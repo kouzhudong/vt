@@ -269,7 +269,6 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Stack, 2 * PAGE_SIZE);
 
-    // 分配 Trampoline 页 — 必须可执行 (NonPagedPool, not NX)
     PVOID TrampolinePage = ExAllocatePoolWithTag(NonPagedPool, PAGE_SIZE, TAG);
     if (TrampolinePage == NULL) {
         ExFreePool(Stack);
@@ -314,7 +313,6 @@ NTSTATUS HvmSubvertCpu()
     SetVMCS(HostRsp, GuestRsp);
 
     rc = __vmx_vmlaunch();
-    // vmlaunch 成功时不返回
     KdPrint(("VMLAUNCH failed!\n"));
 
     size_t FieldValue = 0;
@@ -427,16 +425,9 @@ static VOID UnloadDpcRoutine(
     ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
 
     if (cpuIndex < MAX_CPU_COUNT && g_CpuContext[cpuIndex].Launched) {
-        // 阶段 1: VMCALL 通知 hypervisor 准备卸载
-        // VmxShutdown 会设置 Launched=FALSE 并清除大部分 VM-Exit 拦截
-        // vmresume 将 Guest 送回这里
+        // VMCALL 直接完成 vmxoff + Trampoline 跳转
+        // VmxVmCall 返回时已经不在 VMX 模式了
         VmxVmCall(NBP_HYPERCALL_UNLOAD);
-
-        // 阶段 2: 执行 CPUID 触发最后的 VM-Exit
-        // 此时 VmExitHandler 检测到 Launched==FALSE，执行 vmxoff
-        // vmxoff 后恢复 Guest 状态并跳到 CPUID 之后继续执行
-        int cpuInfo[4];
-        __cpuid(cpuInfo, 0);
     }
 
     KeSignalCallDpcSynchronize(SystemArgument2);

@@ -127,80 +127,22 @@ VOID CmGenerateClearTssBusy(PUCHAR Trampoline, PULONG pOffset, ULONG64 GdtBase, 
 
 
 // =====================================================================
-// VmxShutdown — 通过修改 VMCS Guest 状态 + vmresume 安全卸载
+// VmxShutdown — 直接在 VMCALL 的 VM-Exit 中执行 vmxoff
 //
-// 核心思路:
-//   不执行 __vmx_off() + Trampoline 跳转
-//   而是修改 VMCS 中的 GUEST_RIP/GUEST_RSP/GUEST_RAX 等字段
-//   让 vmresume 直接把 Guest 送回 VmxVmCall 的 ret 指令
-//   Guest 恢复正常执行后再通过 CPUID 触发最后的 vmxoff
+// 不再分两阶段，避免 vmresume 因 GUEST_CR4 约束失败而卡死
 // =====================================================================
 VOID VmxShutdown(PGUEST_REGS GuestRegs)
 {
     ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
 
-    // 读取 Guest 状态
+    // 读取 VMCALL 指令长度，计算返回地址（vmcall 之后的 ret）
     ULONG64 GuestRip = VmxRead(GUEST_RIP);
-    ULONG64 GuestRsp = VmxRead(GUEST_RSP);
     ULONG64 InstLen = VmxRead(VM_EXIT_INSTRUCTION_LEN);
+    ULONG64 nextRip = GuestRip + InstLen;
 
-    // 设置返回值: VmxVmCall 没有返回值要求，
-    // 但 rcx/rdx 需要设置（调用约定中 rcx 是第一个参数）
+    // 设置 VMCALL 返回值
     GuestRegs->rcx = NBP_MAGIC;
     GuestRegs->rdx = 0;
-
-    // 将 Guest RIP 推进到 vmcall 之后 (即 VmxVmCall 中的 ret 指令)
-    __vmx_vmwrite(GUEST_RIP, GuestRip + InstLen);
-    __vmx_vmwrite(GUEST_RSP, GuestRsp);
-
-    // 关闭所有 VM-Exit 拦截，让 Guest 自由运行
-    // 清除 CR masks — CR 写入不再触发 VM-Exit
-    __vmx_vmwrite(CR0_GUEST_HOST_MASK, 0);
-    __vmx_vmwrite(CR4_GUEST_HOST_MASK, 0);
-
-    // 将 Guest CR0/CR4 设为真实值（之前被 shadow 遮蔽）
-    __vmx_vmwrite(GUEST_CR0, VmxRead(GUEST_CR0));
-    ULONG64 guestCr4 = VmxRead(GUEST_CR4);
-    __vmx_vmwrite(GUEST_CR4, guestCr4 & ~X86_CR4_VMXE);
-    __vmx_vmwrite(CR4_READ_SHADOW, guestCr4 & ~X86_CR4_VMXE);
-
-    // 清除异常 bitmap
-    __vmx_vmwrite(EXCEPTION_BITMAP, 0);
-
-    // 设置一个标志：下次 CPUID VM-Exit 时执行 vmxoff
-    g_CpuContext[cpuIndex].Launched = FALSE;  // 复用为 "待 vmxoff" 标志
-
-    // vmresume 回到 Guest, Guest 从 VmxVmCall 的 ret 继续执行
-    // VmxVmCall 返回到 UnloadDpcRoutine
-    // UnloadDpcRoutine 返回前会执行 CPUID (自然发生或我们主动触发)
-    // 该 CPUID 的 VM-Exit 中检测到 Launched==FALSE, 执行 vmxoff
-}
-
-
-NTSTATUS NTAPI HvmResumeGuest()
-{
-    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
-    if (cpuIndex < MAX_CPU_COUNT) {
-        g_CpuContext[cpuIndex].Launched = TRUE;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-
-// VmxoffAndJump 的 C 准备函数：
-// 保存所有 Guest 状态到 Trampoline，然后调用 asm 的 AsmVmxoffAndJump
-VOID DoFinalVmxoff(PGUEST_REGS GuestRegs, ULONG64 nextRip)
-{
-    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
-
-    // 执行真正的 cpuid 让 Guest 得到正确结果
-    int CPUInfo[4] = {-1};
-    __cpuidex(CPUInfo, (int)GuestRegs->rax, (int)GuestRegs->rcx);
-    GuestRegs->rax = CPUInfo[0];
-    GuestRegs->rbx = CPUInfo[1];
-    GuestRegs->rcx = CPUInfo[2];
-    GuestRegs->rdx = CPUInfo[3];
 
     // 在 vmxoff 之前从 VMCS 中读取所有 Guest 状态
     ULONG64 guestCr3 = VmxRead(GUEST_CR3);
@@ -259,56 +201,73 @@ VOID DoFinalVmxoff(PGUEST_REGS GuestRegs, ULONG64 nextRip)
 
     __writecr3(guestCr3);
 
-    // 生成 Trampoline 代码
+    // 标记已关闭
+    g_CpuContext[cpuIndex].Launched = FALSE;
+
+    // 生成 Trampoline 并跳转
     PUCHAR Trampoline = (PUCHAR)g_CpuContext[cpuIndex].TrampolinePage;
     if (!Trampoline) {
-        // 无 Trampoline — 灾难性失败，无法安全恢复
         KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0xDEAD0001, 0, 0, 0);
     }
 
     ULONG uSize = 0;
     RtlZeroMemory(Trampoline, PAGE_SIZE);
 
-    // 恢复通用寄存器
-    CmGenerateMovReg(Trampoline, &uSize, REG_RCX, GuestRegs->rcx);
-    CmGenerateMovReg(Trampoline, &uSize, REG_RDX, GuestRegs->rdx);
-    CmGenerateMovReg(Trampoline, &uSize, REG_RBX, GuestRegs->rbx);
-    CmGenerateMovReg(Trampoline, &uSize, REG_RBP, GuestRegs->rbp);
-    CmGenerateMovReg(Trampoline, &uSize, REG_RSI, GuestRegs->rsi);
-    CmGenerateMovReg(Trampoline, &uSize, REG_RDI, GuestRegs->rdi);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R8, GuestRegs->r8);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R9, GuestRegs->r9);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R10, GuestRegs->r10);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R11, GuestRegs->r11);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R12, GuestRegs->r12);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R13, GuestRegs->r13);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R14, GuestRegs->r14);
-    CmGenerateMovReg(Trampoline, &uSize, REG_R15, GuestRegs->r15);
+    // 关键修复：每次调用都传 Trampoline + uSize 作为写入位置
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RCX, GuestRegs->rcx);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RDX, GuestRegs->rdx);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RBX, GuestRegs->rbx);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RBP, GuestRegs->rbp);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RSI, GuestRegs->rsi);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RDI, GuestRegs->rdi);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R8, GuestRegs->r8);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R9, GuestRegs->r9);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R10, GuestRegs->r10);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R11, GuestRegs->r11);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R12, GuestRegs->r12);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R13, GuestRegs->r13);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R14, GuestRegs->r14);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_R15, GuestRegs->r15);
 
+    // 设置新的 RSP（为 IRETQ 帧预留 40 字节 = 5 * 8）
     ULONG64 NewRsp = guestRsp - 40;
-    CmGenerateMovReg(Trampoline, &uSize, REG_RSP, NewRsp);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RSP, NewRsp);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, (ULONG64)guestSsSel);
-    CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
+    // IRETQ 帧 (push 顺序: SS, RSP, RFLAGS, CS, RIP)
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, (ULONG64)guestSsSel);
+    CmGeneratePushReg(&Trampoline[uSize], &uSize, REG_RAX);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, guestRsp);
-    CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, guestRsp);
+    CmGeneratePushReg(&Trampoline[uSize], &uSize, REG_RAX);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, guestRflags);
-    CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, guestRflags);
+    CmGeneratePushReg(&Trampoline[uSize], &uSize, REG_RAX);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, (ULONG64)guestCsSel);
-    CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, (ULONG64)guestCsSel);
+    CmGeneratePushReg(&Trampoline[uSize], &uSize, REG_RAX);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, nextRip);
-    CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, nextRip);
+    CmGeneratePushReg(&Trampoline[uSize], &uSize, REG_RAX);
 
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, GuestRegs->rax);
-    CmGenerateIretq(Trampoline, &uSize);
+    // 恢复 RAX
+    CmGenerateMovReg(&Trampoline[uSize], &uSize, REG_RAX, GuestRegs->rax);
 
-    // 用 jmp（不是 call）跳到 Trampoline，永不返回
+    // IRETQ
+    CmGenerateIretq(&Trampoline[uSize], &uSize);
+
+    // jmp 到 Trampoline，永不返回
     AsmJmpToTrampoline((ULONG64)Trampoline);
-    // 永远不会到达
+}
+
+
+NTSTATUS NTAPI HvmResumeGuest()
+{
+    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
+    if (cpuIndex < MAX_CPU_COUNT) {
+        g_CpuContext[cpuIndex].Launched = TRUE;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 
@@ -329,14 +288,6 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)
     switch (ExitReason) {
     case EXIT_REASON_CPUID:
     {
-        ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
-        if (cpuIndex < MAX_CPU_COUNT && !g_CpuContext[cpuIndex].Launched) {
-            // vmxoff 路径 — 通过 AsmJmpToTrampoline 永不返回
-            // 这样就不会回到 VmxVmexitHandler 的 vmresume
-            DoFinalVmxoff(GuestRegs, GuestEIP + inst_len);
-            return; // 不会到达
-        }
-
         int CPUInfo[4] = {-1};
         __cpuidex(CPUInfo, (int)GuestRegs->rax, (int)GuestRegs->rcx);
         if (GuestRegs->rax == 0) {
@@ -358,7 +309,7 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)
         switch (HypercallNumber) {
         case NBP_HYPERCALL_UNLOAD:
             VmxShutdown(GuestRegs);
-            return;
+            return;  // 不会到达
         default:
             break;
         }

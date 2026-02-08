@@ -191,6 +191,42 @@ get_access_rights proc
 get_access_rights endp
 
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; 汇编辅助函数 — vmxoff 卸载流程使用
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+; void AsmLoadGdt(void *gdtDescriptor)
+; rcx = 指向 2字节 limit + 8字节 base 的指针
+AsmLoadGdt PROC
+	lgdt	fword ptr [rcx]
+	ret
+AsmLoadGdt ENDP
+
+
+; void AsmLoadIdt(void *idtDescriptor)
+; rcx = 指向 2字节 limit + 8字节 base 的指针
+AsmLoadIdt PROC
+	lidt	fword ptr [rcx]
+	ret
+AsmLoadIdt ENDP
+
+
+; void AsmLoadTr(unsigned short selector)
+; cx = TR selector
+AsmLoadTr PROC
+	ltr		cx
+	ret
+AsmLoadTr ENDP
+
+
+; void __declspec(noreturn) AsmJmpToTrampoline(ULONG64 trampolineAddress)
+; rcx = Trampoline 页地址
+; 使用 jmp 而非 call，不压入返回地址
+; Trampoline 代码会自行设置 RSP 并以 IRETQ 结束
+AsmJmpToTrampoline PROC
+	jmp		rcx
+AsmJmpToTrampoline ENDP
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
