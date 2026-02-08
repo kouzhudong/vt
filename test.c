@@ -276,16 +276,10 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
 
 VOID set_cr4()
-//设置CR4的一个位。
 {
     unsigned __int64 cr4 = __readcr4();
-
-    //VMX-Enable Bit (bit 13 of CR4) — Enables VMX operation when set
-    cr4 = cr4 | 0x2000;//1>>13
-
-    //另一个思路是：_bittestandset, _bittestandset64
-
-    __writecr4((unsigned int)cr4);
+    cr4 = cr4 | 0x2000; // VMX-Enable Bit (bit 13)
+    __writecr4(cr4); // 不要截断为 unsigned int
 }
 
 
@@ -492,12 +486,23 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
-    for (CHAR i = 0; i < KeNumberProcessors; i++) {
-        KeSetSystemAffinityThread((KAFFINITY)((ULONG_PTR)1 << i));
+    ULONG numProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    for (ULONG i = 0; i < numProcs; i++) {
+        PROCESSOR_NUMBER procNumber;
+        KeGetProcessorNumberFromIndex(i, &procNumber);
+        
+        GROUP_AFFINITY affinity = {0};
+        affinity.Group = procNumber.Group;
+        affinity.Mask = (KAFFINITY)1 << procNumber.Number;
+        
+        GROUP_AFFINITY oldAffinity;
+        KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
+        
         KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
         VmxVmCall(NBP_HYPERCALL_UNLOAD);
         KeLowerIrql(OldIrql);
-        KeRevertToUserAffinityThread();
+        
+        KeRevertToUserGroupAffinityThread(&oldAffinity);
     }
 }
 
@@ -517,8 +522,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_NOT_SUPPORTED;
     }
 
-    if (!is_support_intel()) //AMD虚拟化的功能还有待加入。
-    {
+    if (!is_support_intel()) {
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -526,26 +530,30 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_NOT_SUPPORTED;
     }
 
-    //读取0x480的MSR的信息。
-
     if (!is_support_blos()) {
         return STATUS_NOT_SUPPORTED;
     }
 
-    //读取0x48C的MSR的信息，判断是否支持EPT。
-
-    for (CHAR i = 0; i < KeNumberProcessors; i++) {
-        KeSetSystemAffinityThread((KAFFINITY)((ULONG_PTR)1 << i));
+    ULONG numProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    for (ULONG i = 0; i < numProcs; i++) {
+        PROCESSOR_NUMBER procNumber;
+        KeGetProcessorNumberFromIndex(i, &procNumber);
+        
+        GROUP_AFFINITY affinity = {0};
+        affinity.Group = procNumber.Group;
+        affinity.Mask = (KAFFINITY)1 << procNumber.Number;
+        
+        GROUP_AFFINITY oldAffinity;
+        KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
+        
         KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
-
-        // 增加对返回状态的检查，不要用 ASSERT，因为 Release 版本通过后可能会让系统处于不一致状态
-        NTSTATUS Status = CmSubvert();//一个汇编函数：流程是保存所有寄存器(除了段寄存器)的内容到栈里后，调用HvmSubvertCpu
+        NTSTATUS Status = CmSubvert();
         KeLowerIrql(OldIrql);
-        KeRevertToUserAffinityThread();
+        KeRevertToUserGroupAffinityThread(&oldAffinity);
 
         if (!NT_SUCCESS(Status)) {
             KdPrint(("CmSubvert failed on processor %d with status 0x%x\n", i, Status));
-            // 在实际产品中，这里可能需要执行回滚操作（卸载已成功的CPU上的 Hypervisor）
+            // TODO: 回滚已成功的 CPU 上的 Hypervisor
             return Status;
         }
     }
