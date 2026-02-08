@@ -441,6 +441,12 @@ NTSTATUS  CmGuestEip (PVOID);
 VOID GetCpuIdInfo (ULONG32 fn, OUT PULONG32 ret_eax, OUT PULONG32 ret_ebx, OUT PULONG32 ret_ecx, OUT PULONG32 ret_edx);
 size_t get_access_rights(size_t x);
 
+// 汇编辅助函数
+VOID AsmLoadGdt(PVOID gdtDescriptor);
+VOID AsmLoadIdt(PVOID idtDescriptor);
+VOID AsmLoadTr(USHORT selector);
+VOID __declspec(noreturn) AsmJmpToTrampoline(ULONG64 trampolineAddress);
+
 // WDK 头文件中可能未导出的 DPC 广播函数声明
 NTKERNELAPI
 VOID

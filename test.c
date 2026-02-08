@@ -269,7 +269,8 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Stack, 2 * PAGE_SIZE);
 
-    PVOID TrampolinePage = MmAllocateContiguousMemory(PAGE_SIZE, (PHYSICAL_ADDRESS){.QuadPart = -1});
+    // 分配 Trampoline 页 — 必须可执行 (NonPagedPool, not NX)
+    PVOID TrampolinePage = ExAllocatePoolWithTag(NonPagedPool, PAGE_SIZE, TAG);
     if (TrampolinePage == NULL) {
         ExFreePool(Stack);
         MmFreeContiguousMemory(Vmcs);
@@ -282,6 +283,9 @@ NTSTATUS HvmSubvertCpu()
     g_CpuContext[cpuIndex].VmcsRegion = Vmcs;
     g_CpuContext[cpuIndex].HostStack = Stack;
     g_CpuContext[cpuIndex].TrampolinePage = TrampolinePage;
+    g_CpuContext[cpuIndex].IOBitmapA = NULL;
+    g_CpuContext[cpuIndex].IOBitmapB = NULL;
+    g_CpuContext[cpuIndex].MSRBitmap = NULL;
     g_CpuContext[cpuIndex].Launched = FALSE;
 
     set_cr4();
@@ -294,7 +298,7 @@ NTSTATUS HvmSubvertCpu()
     unsigned char rc = __vmx_on((unsigned __int64 *)&PhyAddr);
     if (rc != 0) {
         KdPrint(("__vmx_on failed with rc=%d. Maybe Hyper-V/VBS is active?\n", rc));
-        MmFreeContiguousMemory(TrampolinePage);
+        ExFreePool(TrampolinePage);
         MmFreeContiguousMemory(Vmcs);
         MmFreeContiguousMemory(VmxonR);
         ExFreePool(Stack);
@@ -310,28 +314,26 @@ NTSTATUS HvmSubvertCpu()
     SetVMCS(HostRsp, GuestRsp);
 
     rc = __vmx_vmlaunch();
-    ASSERT(0 == rc);
-    if (0 != rc) {
-        size_t FieldValue = 0;
+    // vmlaunch 成功时不返回
+    KdPrint(("VMLAUNCH failed!\n"));
+
+    size_t FieldValue = 0;
 #define VM_instruction_error  0x00004400
 
-        rc = __vmx_vmread(VM_instruction_error, &FieldValue);
-        if (0 == rc) {
-            KdPrint(("VMLAUNCH error: 0x%llx\n", FieldValue));
-        }
-
-        __vmx_off();
-
-        MmFreeContiguousMemory(TrampolinePage);
-        MmFreeContiguousMemory(Vmcs);
-        MmFreeContiguousMemory(VmxonR);
-        ExFreePool(Stack);
-        RtlZeroMemory(&g_CpuContext[cpuIndex], sizeof(VMX_CPU_CONTEXT));
-    } else {
-        g_CpuContext[cpuIndex].Launched = TRUE;
+    rc = __vmx_vmread(VM_instruction_error, &FieldValue);
+    if (0 == rc) {
+        KdPrint(("VMLAUNCH error: 0x%llx\n", FieldValue));
     }
 
-    return STATUS_SUCCESS;
+    __vmx_off();
+
+    ExFreePool(TrampolinePage);
+    MmFreeContiguousMemory(Vmcs);
+    MmFreeContiguousMemory(VmxonR);
+    ExFreePool(Stack);
+    RtlZeroMemory(&g_CpuContext[cpuIndex], sizeof(VMX_CPU_CONTEXT));
+
+    return STATUS_HV_OPERATION_FAILED;
 }
 
 
@@ -411,7 +413,7 @@ BOOL is_support_cpuid()
 
 
 #pragma warning(push)
-#pragma warning(disable : 6387) // KeGenericCallDpc 保证 SystemArgument1/2 非 NULL
+#pragma warning(disable : 6387)
 static VOID UnloadDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
@@ -425,7 +427,16 @@ static VOID UnloadDpcRoutine(
     ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
 
     if (cpuIndex < MAX_CPU_COUNT && g_CpuContext[cpuIndex].Launched) {
+        // 阶段 1: VMCALL 通知 hypervisor 准备卸载
+        // VmxShutdown 会设置 Launched=FALSE 并清除大部分 VM-Exit 拦截
+        // vmresume 将 Guest 送回这里
         VmxVmCall(NBP_HYPERCALL_UNLOAD);
+
+        // 阶段 2: 执行 CPUID 触发最后的 VM-Exit
+        // 此时 VmExitHandler 检测到 Launched==FALSE，执行 vmxoff
+        // vmxoff 后恢复 Guest 状态并跳到 CPUID 之后继续执行
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);
     }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
@@ -435,7 +446,7 @@ static VOID UnloadDpcRoutine(
 
 
 #pragma warning(push)
-#pragma warning(disable : 6001) // g_CpuContext 在 HvmSubvertCpu 中已初始化，分析器无法跨函数追踪
+#pragma warning(disable : 6001)
 VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
@@ -449,7 +460,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
         }
 
         if (g_CpuContext[i].TrampolinePage) {
-            MmFreeContiguousMemory(g_CpuContext[i].TrampolinePage);
+            ExFreePool(g_CpuContext[i].TrampolinePage);
         }
         if (g_CpuContext[i].VmxonRegion) {
             MmFreeContiguousMemory(g_CpuContext[i].VmxonRegion);
