@@ -4,13 +4,10 @@
 #include <windef.h>
 #include <ntddk.h>
 
-#include <intrin.h> //VS2012编译。
-#include <immintrin.h>//VS2012编译。
-//#include <mmintrin.h> //WDK 编译。
-//#include <emmintrin.h>//WDK 编译。
-//#include <xmmintrin.h>//WDK 编译。
+#include <intrin.h>
+#include <immintrin.h>
 
-#pragma warning(disable : 4201) //使用了非标准扩展: 无名称的结构/联合
+#pragma warning(disable : 4201)
 
 #define EXIT_REASON_EXCEPTION_NMI       0
 #define EXIT_REASON_EXTERNAL_INTERRUPT  1
@@ -54,7 +51,7 @@
 
 #if defined(_WIN64)
 #pragma pack (push, 1)
-typedef struct _AMD64_DESCRIPTOR {// Special Registers for AMD64.
+typedef struct _AMD64_DESCRIPTOR {
     USHORT  Pad[3];
     USHORT  Limit;
     ULONG64 Base;
@@ -77,66 +74,53 @@ typedef union _KGDTENTRY64 {
 
             struct {
                 ULONG   BaseMiddle : 8;
-                ULONG   Type : 5;//把S位包含进去了，也就是是否为系统段描述符的位。
+                ULONG   Type : 5;
                 ULONG   Dpl : 2;
                 ULONG   Present : 1;
                 ULONG   LimitHigh : 4;
-                ULONG   System : 1;//即AVL，系统软件自定义的。
+                ULONG   System : 1;
                 ULONG   LongMode : 1;
-                ULONG   DefaultBig : 1;//即INTEL的D/B (default operation size/default stack pointer size and/or upper bound) flag。
+                ULONG   DefaultBig : 1;
                 ULONG   Granularity : 1;
                 ULONG   BaseHigh : 8;
             } Bits;
         };
-
-        //ULONG BaseUpper;/*经观察，64下的结构的长度是6字节，不是上面定义的16字节。*/
-        //ULONG MustBeZero;
     };
-
-    //ULONG64 Alignment;
 } KGDTENTRY64, *PKGDTENTRY64;
 #pragma pack(pop)
 
-#define CONTROL_REG_ACCESS_NUM          0xf     /* 3:0, number of control register */
-#define CONTROL_REG_ACCESS_TYPE         0x30    /* 5:4, access type */
-#define CONTROL_REG_ACCESS_REG          0xf00   /* 10:8, general purpose register */
+#define CONTROL_REG_ACCESS_NUM          0xf
+#define CONTROL_REG_ACCESS_TYPE         0x30
+#define CONTROL_REG_ACCESS_REG          0xf00
 
-/* XXX these are really VMX specific */
 #define TYPE_MOV_TO_CR          (0 << 4)
 #define TYPE_MOV_FROM_CR        (1 << 4)
 
-/*
- * Intel CPU flags in CR0
- */
-#define X86_CR0_PE              0x00000001      /* Enable Protected Mode    (RW) */
-#define X86_CR0_MP              0x00000002      /* Monitor Coprocessor      (RW) */
-#define X86_CR0_EM              0x00000004      /* Require FPU Emulation    (RO) */
-#define X86_CR0_TS              0x00000008      /* Task Switched            (RW) */
-#define X86_CR0_ET              0x00000010      /* Extension type           (RO) */
-#define X86_CR0_NE              0x00000020      /* Numeric Error Reporting  (RW) */
-#define X86_CR0_WP              0x00010000      /* Supervisor Write Protect (RW) */
-#define X86_CR0_AM              0x00040000      /* Alignment Checking       (RW) */
-#define X86_CR0_NW              0x20000000      /* Not Write-Through        (RW) */
-#define X86_CR0_CD              0x40000000      /* Cache Disable            (RW) */
-#define X86_CR0_PG              0x80000000      /* Paging                   (RW) */
+#define X86_CR0_PE              0x00000001
+#define X86_CR0_MP              0x00000002
+#define X86_CR0_EM              0x00000004
+#define X86_CR0_TS              0x00000008
+#define X86_CR0_ET              0x00000010
+#define X86_CR0_NE              0x00000020
+#define X86_CR0_WP              0x00010000
+#define X86_CR0_AM              0x00040000
+#define X86_CR0_NW              0x20000000
+#define X86_CR0_CD              0x40000000
+#define X86_CR0_PG              0x80000000
 
-/*
- * Intel CPU features in CR4
- */
-#define X86_CR4_VME		0x0001  /* enable vm86 extensions */
-#define X86_CR4_PVI		0x0002  /* virtual interrupts flag enable */
-#define X86_CR4_TSD		0x0004  /* disable time stamp at ipl 3 */
-#define X86_CR4_DE		0x0008  /* enable debugging extensions */
-#define X86_CR4_PSE		0x0010  /* enable page size extensions */
-#define X86_CR4_PAE		0x0020  /* enable physical address extensions */
-#define X86_CR4_MCE		0x0040  /* Machine check enable */
-#define X86_CR4_PGE		0x0080  /* enable global pages */
-#define X86_CR4_PCE		0x0100  /* enable performance counters at ipl 3 */
-#define X86_CR4_OSFXSR		0x0200  /* enable fast FPU save and restore */
-#define X86_CR4_OSXMMEXCPT	0x0400  /* enable unmasked SSE exceptions */
-#define X86_CR4_VMXE		0x2000  /* enable VMX */
+#define X86_CR4_VME		0x0001
+#define X86_CR4_PVI		0x0002
+#define X86_CR4_TSD		0x0004
+#define X86_CR4_DE		0x0008
+#define X86_CR4_PSE		0x0010
+#define X86_CR4_PAE		0x0020
+#define X86_CR4_MCE		0x0040
+#define X86_CR4_PGE		0x0080
+#define X86_CR4_PCE		0x0100
+#define X86_CR4_OSFXSR		0x0200
+#define X86_CR4_OSXMMEXCPT	0x0400
+#define X86_CR4_VMXE		0x2000
 
-/* MSRs & bits used for VMX enabling */
 #define MSR_IA32_VMX_BASIC   		0x480
 #define MSR_IA32_VMX_PINBASED_CTLS	0x481
 #define MSR_IA32_VMX_PROCBASED_CTLS	0x482
@@ -147,27 +131,27 @@ typedef union _KGDTENTRY64 {
 #define MSR_IA32_SYSENTER_ESP		0x175
 #define MSR_IA32_SYSENTER_EIP		0x176
 #define MSR_IA32_DEBUGCTL			0x1d9
-#define IA32_FEATURE_CONTROL        0x3A //58
+#define IA32_FEATURE_CONTROL        0x3A
 
-#define MSR_FS_BASE         0xc0000100        /* 64bit FS base */
-#define MSR_GS_BASE         0xc0000101        /* 64bit GS base */
+#define MSR_FS_BASE         0xc0000100
+#define MSR_GS_BASE         0xc0000101
 
 typedef struct _GUEST_REGS{
-  ULONG64 rax;                  // 0x00         // NOT VALID FOR SVM
+  ULONG64 rax;
   ULONG64 rcx;
-  ULONG64 rdx;                  // 0x10
+  ULONG64 rdx;
   ULONG64 rbx;
-  ULONG64 rsp;                  // 0x20         // rsp is not stored here on SVM
+  ULONG64 rsp;
   ULONG64 rbp;
-  ULONG64 rsi;                  // 0x30
+  ULONG64 rsi;
   ULONG64 rdi;
-  ULONG64 r8;                   // 0x40
+  ULONG64 r8;
   ULONG64 r9;
-  ULONG64 r10;                  // 0x50
+  ULONG64 r10;
   ULONG64 r11;
-  ULONG64 r12;                  // 0x60
+  ULONG64 r12;
   ULONG64 r13;
-  ULONG64 r14;                  // 0x70
+  ULONG64 r14;
   ULONG64 r15;
 } GUEST_REGS, *PGUEST_REGS;
 
@@ -176,22 +160,20 @@ typedef struct _GUEST_REGS{
 
 #define VM_ENTRY_IA32E_MODE             0x00000200
 
-// ntamd64_x.h
-#define KGDT64_NULL (0 * 16)    // NULL descriptor
-#define KGDT64_R0_CODE (1 * 16) // kernel mode 64-bit code
-#define KGDT64_R0_DATA (1 * 16) + 8     // kernel mode 64-bit data (stack)
-#define KGDT64_R3_CMCODE (2 * 16)       // user mode 32-bit code
-#define KGDT64_R3_DATA (2 * 16) + 8     // user mode 32-bit data
-#define KGDT64_R3_CODE (3 * 16) // user mode 64-bit code
-#define KGDT64_SYS_TSS (4 * 16) // kernel mode system task state
-#define KGDT64_R3_CMTEB (5 * 16)        // user mode 32-bit TEB
-#define KGDT64_R0_CMCODE (6 * 16)       // kernel mode 32-bit code
+#define KGDT64_NULL (0 * 16)
+#define KGDT64_R0_CODE (1 * 16)
+#define KGDT64_R0_DATA (1 * 16) + 8
+#define KGDT64_R3_CMCODE (2 * 16)
+#define KGDT64_R3_DATA (2 * 16) + 8
+#define KGDT64_R3_CODE (3 * 16)
+#define KGDT64_SYS_TSS (4 * 16)
+#define KGDT64_R3_CMTEB (5 * 16)
+#define KGDT64_R0_CMCODE (6 * 16)
 
-// this must be synchronized with CmSetBluepillSelectors() (common-asm.asm)
-#define	BP_GDT64_CODE		KGDT64_R0_CODE  // cs
-#define BP_GDT64_DATA		KGDT64_R0_DATA  // ds, es, ss
-#define BP_GDT64_SYS_TSS	KGDT64_SYS_TSS  // tr
-#define BP_GDT64_PCR		KGDT64_R0_DATA  // gs
+#define	BP_GDT64_CODE		KGDT64_R0_CODE
+#define BP_GDT64_DATA		KGDT64_R0_DATA
+#define BP_GDT64_SYS_TSS	KGDT64_SYS_TSS
+#define BP_GDT64_PCR		KGDT64_R0_DATA
 
 enum
 {
@@ -324,35 +306,34 @@ enum
 };
 
 
-/// See: Definitions of Secondary Processor-Based VM-Execution Controls
 typedef union _VmxSecondaryProcessorBasedControls
 {
     unsigned int all;
     struct
     {
-        unsigned virtualize_apic_accesses : 1;      //!< [0]
-        unsigned enable_ept : 1;                    //!< [1]
-        unsigned descriptor_table_exiting : 1;      //!< [2]
-        unsigned enable_rdtscp : 1;                 //!< [3]
-        unsigned virtualize_x2apic_mode : 1;        //!< [4]
-        unsigned enable_vpid : 1;                   //!< [5]
-        unsigned wbinvd_exiting : 1;                //!< [6]
-        unsigned unrestricted_guest : 1;            //!< [7]
-        unsigned apic_register_virtualization : 1;  //!< [8]
-        unsigned virtual_interrupt_delivery : 1;    //!< [9]
-        unsigned pause_loop_exiting : 1;            //!< [10]
-        unsigned rdrand_exiting : 1;                //!< [11]
-        unsigned enable_invpcid : 1;                //!< [12]
-        unsigned enable_vm_functions : 1;           //!< [13]
-        unsigned vmcs_shadowing : 1;                //!< [14]
-        unsigned reserved1 : 1;                     //!< [15]
-        unsigned rdseed_exiting : 1;                //!< [16]
-        unsigned reserved2 : 1;                     //!< [17]
-        unsigned ept_violation_ve : 1;              //!< [18]
-        unsigned reserved3 : 1;                     //!< [19]
-        unsigned enable_xsaves_xstors : 1;          //!< [20]
-        unsigned reserved4 : 4;                     //!< [21:24]
-        unsigned use_tsc_scaling : 1;               //!< [25]
+        unsigned virtualize_apic_accesses : 1;
+        unsigned enable_ept : 1;
+        unsigned descriptor_table_exiting : 1;
+        unsigned enable_rdtscp : 1;
+        unsigned virtualize_x2apic_mode : 1;
+        unsigned enable_vpid : 1;
+        unsigned wbinvd_exiting : 1;
+        unsigned unrestricted_guest : 1;
+        unsigned apic_register_virtualization : 1;
+        unsigned virtual_interrupt_delivery : 1;
+        unsigned pause_loop_exiting : 1;
+        unsigned rdrand_exiting : 1;
+        unsigned enable_invpcid : 1;
+        unsigned enable_vm_functions : 1;
+        unsigned vmcs_shadowing : 1;
+        unsigned reserved1 : 1;
+        unsigned rdseed_exiting : 1;
+        unsigned reserved2 : 1;
+        unsigned ept_violation_ve : 1;
+        unsigned reserved3 : 1;
+        unsigned enable_xsaves_xstors : 1;
+        unsigned reserved4 : 4;
+        unsigned use_tsc_scaling : 1;
     } fields;
 }VmxSecondaryProcessorBasedControls;
 
@@ -362,38 +343,38 @@ typedef union _VMX_CPU_BASED_CONTROLS
     ULONG32 All;
     struct
     {
-        ULONG32 Reserved1 : 2;                 // [0-1]
-        ULONG32 InterruptWindowExiting : 1;    // [2]
-        ULONG32 UseTSCOffseting : 1;           // [3]
-        ULONG32 Reserved2 : 3;                 // [4-6]
-        ULONG32 HLTExiting : 1;                // [7]
-        ULONG32 Reserved3 : 1;                 // [8]
-        ULONG32 INVLPGExiting : 1;             // [9]
-        ULONG32 MWAITExiting : 1;              // [10]
-        ULONG32 RDPMCExiting : 1;              // [11]
-        ULONG32 RDTSCExiting : 1;              // [12]
-        ULONG32 Reserved4 : 2;                 // [13-14]
-        ULONG32 CR3LoadExiting : 1;            // [15]
-        ULONG32 CR3StoreExiting : 1;           // [16]
-        ULONG32 Reserved5 : 2;                 // [17-18]
-        ULONG32 CR8LoadExiting : 1;            // [19]
-        ULONG32 CR8StoreExiting : 1;           // [20]
-        ULONG32 UseTPRShadowExiting : 1;       // [21]
-        ULONG32 NMIWindowExiting : 1;          // [22]
-        ULONG32 MovDRExiting : 1;              // [23]
-        ULONG32 UnconditionalIOExiting : 1;    // [24]
-        ULONG32 UseIOBitmaps : 1;              // [25]
-        ULONG32 Reserved6 : 1;                 // [26]
-        ULONG32 MonitorTrapFlag : 1;           // [27]
-        ULONG32 UseMSRBitmaps : 1;             // [28]
-        ULONG32 MONITORExiting : 1;            // [29]
-        ULONG32 PAUSEExiting : 1;              // [30]
-        ULONG32 ActivateSecondaryControl : 1;  // [31]
+        ULONG32 Reserved1 : 2;
+        ULONG32 InterruptWindowExiting : 1;
+        ULONG32 UseTSCOffseting : 1;
+        ULONG32 Reserved2 : 3;
+        ULONG32 HLTExiting : 1;
+        ULONG32 Reserved3 : 1;
+        ULONG32 INVLPGExiting : 1;
+        ULONG32 MWAITExiting : 1;
+        ULONG32 RDPMCExiting : 1;
+        ULONG32 RDTSCExiting : 1;
+        ULONG32 Reserved4 : 2;
+        ULONG32 CR3LoadExiting : 1;
+        ULONG32 CR3StoreExiting : 1;
+        ULONG32 Reserved5 : 2;
+        ULONG32 CR8LoadExiting : 1;
+        ULONG32 CR8StoreExiting : 1;
+        ULONG32 UseTPRShadowExiting : 1;
+        ULONG32 NMIWindowExiting : 1;
+        ULONG32 MovDRExiting : 1;
+        ULONG32 UnconditionalIOExiting : 1;
+        ULONG32 UseIOBitmaps : 1;
+        ULONG32 Reserved6 : 1;
+        ULONG32 MonitorTrapFlag : 1;
+        ULONG32 UseMSRBitmaps : 1;
+        ULONG32 MONITORExiting : 1;
+        ULONG32 PAUSEExiting : 1;
+        ULONG32 ActivateSecondaryControl : 1;
     } Fields;
 } VMX_CPU_BASED_CONTROLS, *PVMX_CPU_BASED_CONTROLS;
 
 
-#define TAG	'tset' //test
+#define TAG	'tset'
 #define NBP_MAGIC ((ULONG32)'!LTI')
 #define NBP_HYPERCALL_UNLOAD    0x1
 
@@ -428,9 +409,21 @@ typedef union _VMX_CPU_BASED_CONTROLS
 #define REG_CR4	REG_CONTROL | 4
 #define REG_CR8	REG_CONTROL | 8
 
+// 每个 CPU 的 VMX 上下文，用于安全卸载
+typedef struct _VMX_CPU_CONTEXT {
+    PVOID  VmxonRegion;       // VMXON region 虚拟地址
+    PVOID  VmcsRegion;        // VMCS region 虚拟地址
+    PVOID  HostStack;         // Host 栈
+    PVOID  TrampolinePage;    // 预分配的 Trampoline 可执行页
+    PVOID  IOBitmapA;         // IO Bitmap A 虚拟地址
+    PVOID  IOBitmapB;         // IO Bitmap B 虚拟地址
+    PVOID  MSRBitmap;         // MSR Bitmap 虚拟地址
+    BOOLEAN Launched;         // 此 CPU 是否已 VMLAUNCH
+} VMX_CPU_CONTEXT, *PVMX_CPU_CONTEXT;
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-//一些汇编实现的函数。
+// 全局 per-CPU 上下文数组（最多支持 256 个处理器）
+#define MAX_CPU_COUNT 256
+extern VMX_CPU_CONTEXT g_CpuContext[MAX_CPU_COUNT];
 
 USHORT RegGetCs ();
 USHORT RegGetDs ();

@@ -1,14 +1,15 @@
 #include "h.h"
 
+// 全局 per-CPU 上下文
+VMX_CPU_CONTEXT g_CpuContext[MAX_CPU_COUNT] = {0};
+
 
 static ULONG32  VmxAdjustControls(ULONG32 Ctl, ULONG32 Msr)
 {
     LARGE_INTEGER MsrValue;
 
     MsrValue.QuadPart = __readmsr(Msr);
-    // 高位部分为 0 的位，CTL 中必须为 0 (不允许设为1)
     Ctl &= MsrValue.HighPart;
-    // 低位部分为 1 的位，CTL 中必须为 1 (强制设为1)
     Ctl |= MsrValue.LowPart;
     return Ctl;
 }
@@ -18,7 +19,6 @@ SSIZE_T get_segment_selector(IN SSIZE_T segment_registers)
 {
     SSIZE_T segment_selector = segment_registers;
 
-    //屏蔽低3位。即在GDT的地址，每一项8字节对齐。
     _bittestandreset64(&segment_selector, 0);
     _bittestandreset64(&segment_selector, 1);
     _bittestandreset64(&segment_selector, 2);
@@ -29,12 +29,7 @@ SSIZE_T get_segment_selector(IN SSIZE_T segment_registers)
 
 SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
 {
-    //SIZE_T BaseLow = 0;
-    //SIZE_T BaseMiddle = 0;
-    //SIZE_T BaseHigh = 0;
-
     if (_bittest64(&Segment_Registers, 2) == 1) {
-        //在LDT中。
         return 0;
     }
 
@@ -42,21 +37,13 @@ SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
         return 0;
     }
 
-    //清楚低三位的标志，也就是获取Segment Selector。
     SSIZE_T Segment_Selector = get_segment_selector(Segment_Registers);
 
     PKGDTENTRY64 p = (PKGDTENTRY64)((Segment_Selector)+(SIZE_T)(KeGetPcr()->GdtBase));
 
     SIZE_T Base = (p->Bytes.BaseHigh << 24) | (p->Bytes.BaseMiddle << 16) | (p->BaseLow);
 
-    //if (p->Bits.DefaultBig && Base)
-    //{
-    //    //扩充高位为1.即F.
-    //    Base += 0xffffffff00000000;
-    //}
-
-    //TSS的有点特殊。请看在WINDBG中用命令查看GDT。其实这个值可以在每个CPU的PCR中获取。
-    if (!(p->Bytes.Flags1 & 0x10)) {// this is a TSS or callgate etc, save the base high part    
+    if (!(p->Bytes.Flags1 & 0x10)) {
         Base |= (*(PULONG64)((PUCHAR)p + 8)) << 32;
     }
 
@@ -67,108 +54,74 @@ SIZE_T Get_Segment_Base(IN SSIZE_T Segment_Registers)
 SIZE_T get_segments_access_right(SIZE_T segment_registers)
 {
     if (0 == segment_registers) {
-        return 0x10000i64;//Ldtr会走这里。为何返回这个数，有待思考。
+        return 0x10000i64;
     }
 
-    SIZE_T access_right = get_access_rights(segment_registers);
-    /*
-    估计这个返回的是：Segment Descriptor的高DWORD，但是也排除这个 DWORD的高八位（Base 31:24）和低八位（Base 23:16）。
-    */
-
-    /*
-    此时剩余的有效位是十六位，即一个WORD，但是低八位要移除。
-    但是这16位中还有几位（4位）位：Seg.Limit19:16，所以要清除。
-    所以有此算法。
-    由此可见：segments_access_right就是segments中除去limit和Base的剩余部分，其格式以WORD存在。
-    */
-    access_right = (get_access_rights(segment_registers) >> 8) & 0xF0FF;
+    SIZE_T access_right = (get_access_rights(segment_registers) >> 8) & 0xF0FF;
 
     return access_right;
 }
 
 
-PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
+// 分配连续物理内存并返回物理地址。同时通过 ppVA 返回虚拟地址供后续释放。
+PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPagesEx(PVOID *ppVA)
 {
     PHYSICAL_ADDRESS l1, l2, l3;
 
     l1.QuadPart = 0;
     l2.QuadPart = -1;
-    l3.QuadPart = 0x200000; // 边界对齐
+    l3.QuadPart = 0x200000;
 
-    // 修复：使用 MmAllocateContiguousNodeMemory 替代废弃API，提高兼容性
     PVOID PageVA = MmAllocateContiguousNodeMemory(PAGE_SIZE, l1, l2, l3, PAGE_READWRITE, MM_ANY_NODE_OK);
 
-    // ASSERT(PageVA); // 如果内存耗尽，ASSERT会导致蓝屏，建议在Release中移除
     if (PageVA) {
         RtlZeroMemory(PageVA, PAGE_SIZE);
+        if (ppVA) *ppVA = PageVA;
         return MmGetPhysicalAddress(PageVA);
     } else {
+        if (ppVA) *ppVA = NULL;
         PHYSICAL_ADDRESS invalid = {0};
         return invalid;
     }
 }
 
+// 保持旧接口兼容
+PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
+{
+    return MmAllocateContiguousPagesEx(NULL);
+}
+
 
 VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 {
-    SIZE_T           GdtBase = (SIZE_T)(KeGetPcr()->GdtBase);//r gdtr
+    SIZE_T           GdtBase = (SIZE_T)(KeGetPcr()->GdtBase);
     AMD64_DESCRIPTOR idtr = {0};
-    //PKPCR            pcr = KeGetPcr();
+    ULONG            cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
 
-    // 关键修正：确保 MSR Bitmap 内存被正确分配。
-    // 如果分配失败（Phys=0），系统会访问物理地址0，导致异常。但在这里我们已经在分配函数里做了处理。
-    PHYSICAL_ADDRESS IOBitmapAPA = MmAllocateContiguousPages();
-    PHYSICAL_ADDRESS IOBitmapBPA = MmAllocateContiguousPages();
-    PHYSICAL_ADDRESS MSRBitmapPA = MmAllocateContiguousPages();
-
-    //unsigned char r = 0;     
+    PHYSICAL_ADDRESS IOBitmapAPA = MmAllocateContiguousPagesEx(&g_CpuContext[cpuIndex].IOBitmapA);
+    PHYSICAL_ADDRESS IOBitmapBPA = MmAllocateContiguousPagesEx(&g_CpuContext[cpuIndex].IOBitmapB);
+    PHYSICAL_ADDRESS MSRBitmapPA = MmAllocateContiguousPagesEx(&g_CpuContext[cpuIndex].MSRBitmap);
 
     __sidt(&idtr.Limit);
 
-    // 在 64 位模式下，该字段是 64 位的。设置为全 1 (-1) 表示不使用 VMCS 链接指针。
     __vmx_vmwrite(VMCS_LINK_POINTER, 0xffffffffffffffffULL);
-    // __vmx_vmwrite (VMCS_LINK_POINTER_HIGH, 0xffffffff); // 不需要，64位环境不支持 High 字段操作
 
-    // PIN-BASED CONTROLS
     __vmx_vmwrite(PIN_BASED_VM_EXEC_CONTROL, VmxAdjustControls(0, MSR_IA32_VMX_PINBASED_CTLS));
 
-    // PRIMARY PROCESSOR-BASED CONTROLS
     VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {0};
-
-    // [FIX 1] 启用 MSR Bitmaps
-    // Win11 访问大量特定 MSR，如果不启用 Bitmap（让所有MSR访问都产生 VMExit），会导致极高的性能开销，看起来像卡死。
-    // 我们传入全 0 的 Bitmap，意味着不拦截任何 MSR，直通硬件，性能最好。
     vmCpuCtlRequested.Fields.UseMSRBitmaps = 1;
-
     vmCpuCtlRequested.Fields.ActivateSecondaryControl = TRUE;
     vmCpuCtlRequested.Fields.UseTSCOffseting = 0;
-
-    // [FIX 2] 禁用 RDTSC 退出 !!!
-    // 此处原代码为 TRUE。在 Win11 上，RDTSC 被高频使用。
-    // 除非你有极其优化的汇编处理程序并正确处理 RDTSCP 的 RCX 寄存器，否则开启此项会导致系统卡顿甚至 "Freeze"。
-    // 这里改为 FALSE，允许 Guest 直接执行 RDTSC。
     vmCpuCtlRequested.Fields.RDTSCExiting = FALSE;
-
-    vmCpuCtlRequested.Fields.CR3LoadExiting = 0;// VPID caches must be invalidated on CR3 change
+    vmCpuCtlRequested.Fields.CR3LoadExiting = 0;
     size_t x = VmxAdjustControls(vmCpuCtlRequested.All, 0x48E);
     __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, x);
 
-
-    // SECONDARY PROCESSOR-BASED CONTROLS
     VmxSecondaryProcessorBasedControls vm_procctl2_requested = {0};
     vm_procctl2_requested.fields.enable_ept = 0;
     vm_procctl2_requested.fields.descriptor_table_exiting = 0;
-
-    // [FIX 3] Enable RDTSCP
-    // 即使 RDTSCExiting = 0，如果 enable_rdtscp = 0，Guest 执行 RDTSCP 指令会触发 #UD 异常。
-    // Win10/11 必须置 1。
     vm_procctl2_requested.fields.enable_rdtscp = 1;
-
     vm_procctl2_requested.fields.enable_vpid = 0;
-
-    // [FIX 4] Win11 必需特性支持
-    // Windows 11 默认使用 XSAVES/XRSTORS 和 INVPCID。
-    // 如果不在 VMCS 中声明支持，Guest 尝试执行时会触发 #UD。
     vm_procctl2_requested.fields.enable_xsaves_xstors = 1;
     vm_procctl2_requested.fields.enable_invpcid = 1;
 
@@ -182,16 +135,14 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(CR4_GUEST_HOST_MASK, X86_CR4_VMXE);
     __vmx_vmwrite(CR4_READ_SHADOW, __readcr4() & ~X86_CR4_VMXE);
     __vmx_vmwrite(CR0_GUEST_HOST_MASK, X86_CR0_PG);
-    __vmx_vmwrite(CR0_READ_SHADOW, (__readcr4() & X86_CR0_PG) | X86_CR0_PG);
+    __vmx_vmwrite(CR0_READ_SHADOW, (__readcr0() & X86_CR0_PG) | X86_CR0_PG);
 
-    // 写入地址字段
     __vmx_vmwrite(IO_BITMAP_A, IOBitmapAPA.QuadPart);
     __vmx_vmwrite(IO_BITMAP_B, IOBitmapBPA.QuadPart);
     __vmx_vmwrite(MSR_BITMAP, MSRBitmapPA.QuadPart);
 
     __vmx_vmwrite(EXCEPTION_BITMAP, 0);
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
     // Guest State Area
     __vmx_vmwrite(GUEST_ES_SELECTOR, RegGetEs());
     __vmx_vmwrite(GUEST_CS_SELECTOR, RegGetCs());
@@ -200,18 +151,18 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
     __vmx_vmwrite(GUEST_FS_SELECTOR, RegGetFs());
     __vmx_vmwrite(GUEST_GS_SELECTOR, RegGetGs());
     __vmx_vmwrite(GUEST_LDTR_SELECTOR, GetLdtr());
-    __vmx_vmwrite(GUEST_TR_SELECTOR, GetTrSelector());//应该和r tr这个命令的结果一样。
+    __vmx_vmwrite(GUEST_TR_SELECTOR, GetTrSelector());
 
-    __vmx_vmwrite(GUEST_ES_LIMIT, __segmentlimit(RegGetEs()));//__segmentlimit
+    __vmx_vmwrite(GUEST_ES_LIMIT, __segmentlimit(RegGetEs()));
     __vmx_vmwrite(GUEST_CS_LIMIT, __segmentlimit(RegGetCs()));
     __vmx_vmwrite(GUEST_SS_LIMIT, __segmentlimit(RegGetSs()));
     __vmx_vmwrite(GUEST_DS_LIMIT, __segmentlimit(RegGetDs()));
     __vmx_vmwrite(GUEST_FS_LIMIT, __segmentlimit(RegGetFs()));
     __vmx_vmwrite(GUEST_GS_LIMIT, __segmentlimit(RegGetGs()));
     __vmx_vmwrite(GUEST_TR_LIMIT, __segmentlimit(GetTrSelector()));
-    __vmx_vmwrite(GUEST_IDTR_LIMIT, idtr.Limit);//r idtl
+    __vmx_vmwrite(GUEST_IDTR_LIMIT, idtr.Limit);
     __vmx_vmwrite(GUEST_LDTR_LIMIT, __segmentlimit(GetLdtr()));
-    __vmx_vmwrite(GUEST_GDTR_LIMIT, GetGdtLimit()); //r gdtl
+    __vmx_vmwrite(GUEST_GDTR_LIMIT, GetGdtLimit());
 
     __vmx_vmwrite(GUEST_ES_AR_BYTES, get_segments_access_right(RegGetEs()));
     __vmx_vmwrite(GUEST_CS_AR_BYTES, get_segments_access_right(RegGetCs()));
@@ -224,8 +175,8 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
     __vmx_vmwrite(GUEST_FS_BASE, __readmsr(MSR_FS_BASE));
     __vmx_vmwrite(GUEST_GS_BASE, __readmsr(MSR_GS_BASE));
-    __vmx_vmwrite(GUEST_TR_BASE, (SIZE_T)KeGetPcr()->TssBase);//Get_Segment_Base(GetTrSelector())
-    __vmx_vmwrite(GUEST_IDTR_BASE, idtr.Base);//r idtr
+    __vmx_vmwrite(GUEST_TR_BASE, (SIZE_T)KeGetPcr()->TssBase);
+    __vmx_vmwrite(GUEST_IDTR_BASE, idtr.Base);
     __vmx_vmwrite(GUEST_LDTR_BASE, Get_Segment_Base(GetLdtr()));
     __vmx_vmwrite(GUEST_GDTR_BASE, GdtBase);
 
@@ -239,15 +190,13 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
     __vmx_vmwrite(GUEST_DR7, 0x400);
 
-    __vmx_vmwrite(GUEST_RSP, GuestRsp);//GuestRsp (SIZE_T)CmSubvert
+    __vmx_vmwrite(GUEST_RSP, GuestRsp);
     __vmx_vmwrite(GUEST_RIP, (SIZE_T)CmGuestEip);
     __vmx_vmwrite(GUEST_RFLAGS, __getcallerseflags());
 
     __vmx_vmwrite(GUEST_IA32_DEBUGCTL, __readmsr(MSR_IA32_DEBUGCTL));
-    // __vmx_vmwrite (GUEST_IA32_DEBUGCTL_HIGH, __readmsr (MSR_IA32_DEBUGCTL) >> 32); // 64位环境不需要
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
-
+    // Host State Area
     __vmx_vmwrite(HOST_CS_SELECTOR, get_segment_selector(RegGetCs()));
     __vmx_vmwrite(HOST_DS_SELECTOR, get_segment_selector(RegGetDs()));
     __vmx_vmwrite(HOST_ES_SELECTOR, get_segment_selector(RegGetEs()));
@@ -278,34 +227,36 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 VOID set_cr4()
 {
     unsigned __int64 cr4 = __readcr4();
-    cr4 = cr4 | 0x2000; // VMX-Enable Bit (bit 13)
-    __writecr4(cr4); // 不要截断为 unsigned int
+    cr4 = cr4 | 0x2000;
+    __writecr4(cr4);
 }
 
 
 NTSTATUS HvmSubvertCpu()
 {
     PHYSICAL_ADDRESS PhyAddr;
-    SIZE_T GuestRsp = (size_t)_AddressOfReturnAddress() + sizeof(void *);//即父函数中的RSP的值。_ReturnAddress().
+    SIZE_T GuestRsp = (size_t)_AddressOfReturnAddress() + sizeof(void *);
     PHYSICAL_ADDRESS lowest_acceptable_address = {0};
     PHYSICAL_ADDRESS boundary_address_multiple = {0};
+    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
 
-    // 检查是否已经在 Hypervisor 之下（例如 VBS/Hyper-V 开启）
+    if (cpuIndex >= MAX_CPU_COUNT) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
     int CPUInfo[4];
     __cpuid(CPUInfo, 1);
     if ((CPUInfo[2] & 0x80000000) != 0) {
-        KdPrint(("Warning: Hypervisor present bit is set. VMXON might fail or cause nested VM exit loop.\n"));
+        KdPrint(("Warning: Hypervisor present bit is set. VMXON might fail.\n"));
     }
 
-    PhyAddr.QuadPart = -1;//MmAllocateNonCachedMemory 
-    //VmxonR = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
+    PhyAddr.QuadPart = -1;
     PVOID VmxonR = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
     if (VmxonR == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(VmxonR, PAGE_SIZE);
 
-    //Vmcs  = MmAllocateContiguousMemory(PAGE_SIZE, PhyAddr);
     PVOID Vmcs = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest_acceptable_address, PhyAddr, boundary_address_multiple, PAGE_READWRITE, MM_ANY_NODE_OK);
     if (Vmcs == NULL) {
         MmFreeContiguousMemory(VmxonR);
@@ -313,17 +264,30 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Vmcs, PAGE_SIZE);
 
-    PVOID Stack = ExAllocatePoolWithTag(NonPagedPoolNx, 2 * PAGE_SIZE, TAG); // ExAllocatePool2容易失败。
+    PVOID Stack = ExAllocatePoolWithTag(NonPagedPoolNx, 2 * PAGE_SIZE, TAG);
     if (Stack == NULL) {
-        if (Vmcs) {
-            MmFreeContiguousMemory(Vmcs);
-        }
-        if (VmxonR) {
-            MmFreeContiguousMemory(VmxonR);
-        }
+        MmFreeContiguousMemory(Vmcs);
+        MmFreeContiguousMemory(VmxonR);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(Stack, 2 * PAGE_SIZE);
+
+    // 预分配 Trampoline 页（必须可执行，用 MmAllocateContiguousMemory）
+    PVOID TrampolinePage = MmAllocateContiguousMemory(PAGE_SIZE, (PHYSICAL_ADDRESS){.QuadPart = -1});
+    if (TrampolinePage == NULL) {
+        ExFreePool(Stack);
+        MmFreeContiguousMemory(Vmcs);
+        MmFreeContiguousMemory(VmxonR);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(TrampolinePage, PAGE_SIZE);
+
+    // 保存到全局上下文，供卸载时使用
+    g_CpuContext[cpuIndex].VmxonRegion = VmxonR;
+    g_CpuContext[cpuIndex].VmcsRegion = Vmcs;
+    g_CpuContext[cpuIndex].HostStack = Stack;
+    g_CpuContext[cpuIndex].TrampolinePage = TrampolinePage;
+    g_CpuContext[cpuIndex].Launched = FALSE;
 
     set_cr4();
 
@@ -332,16 +296,15 @@ NTSTATUS HvmSubvertCpu()
 
     PhyAddr = MmGetPhysicalAddress(VmxonR);
 
-    // [SAFETY] 检查 __vmx_on 返回值。如果失败(例如 VBS 开启且未启用嵌套)，继续执行会导致 0x7E 蓝屏
     unsigned char rc = __vmx_on((unsigned __int64 *)&PhyAddr);
-
     if (rc != 0) {
         KdPrint(("__vmx_on failed with rc=%d. Maybe Hyper-V/VBS is active?\n", rc));
-
+        MmFreeContiguousMemory(TrampolinePage);
         MmFreeContiguousMemory(Vmcs);
         MmFreeContiguousMemory(VmxonR);
         ExFreePool(Stack);
-        return STATUS_HV_OPERATION_FAILED; // 宏需要在头文件定义，或使用 STATUS_UNSUCCESSFUL
+        RtlZeroMemory(&g_CpuContext[cpuIndex], sizeof(VMX_CPU_CONTEXT));
+        return STATUS_HV_OPERATION_FAILED;
     }
 
     PhyAddr = MmGetPhysicalAddress(Vmcs);
@@ -359,16 +322,18 @@ NTSTATUS HvmSubvertCpu()
 
         rc = __vmx_vmread(VM_instruction_error, &FieldValue);
         if (0 == rc) {
-            //根据错误码：FieldValue参见：30.4 VM INSTRUCTION ERROR NUMBERS
-            //KdPrint(("__vmx_vmread VM_instruction_error FieldValue:0x%x. in line: %d at file:%s.\r\n", FieldValue, __LINE__, __FILE__));
+            KdPrint(("VMLAUNCH error: 0x%llx\n", FieldValue));
         }
 
         __vmx_off();
 
-        //释放内存 - 防止泄漏
+        MmFreeContiguousMemory(TrampolinePage);
         MmFreeContiguousMemory(Vmcs);
         MmFreeContiguousMemory(VmxonR);
         ExFreePool(Stack);
+        RtlZeroMemory(&g_CpuContext[cpuIndex], sizeof(VMX_CPU_CONTEXT));
+    } else {
+        g_CpuContext[cpuIndex].Launched = TRUE;
     }
 
     return STATUS_SUCCESS;
@@ -376,29 +341,17 @@ NTSTATUS HvmSubvertCpu()
 
 
 BOOL is_support_blos()
-/*
-功能：判断主板中是否开启vmx。
-可以用位结构：
-https://msdn.microsoft.com/zh-cn/library/ewwyfdbe.aspx
-https://msdn.microsoft.com/zh-cn/library/yszfawxh.aspx
-也可以用指令完成：
-https://msdn.microsoft.com/en-us/library/h65k4tze.aspx
-
-权威资料：
-23.7 ENABLING AND ENTERING VMX OPERATION
-*/
 {
     SSIZE_T FeatureControlMsr = __readmsr(IA32_FEATURE_CONTROL);
 
     unsigned char b = _bittest64(&FeatureControlMsr, 0);
     if (0 == b) {
-        return FALSE;//If this bit is clear, VMXON causes a general-protection exception.
+        return FALSE;
     }
 
     b = _bittest64(&FeatureControlMsr, 1);
     if (0 == b) {
-        KdPrint(("SMX 下不支持 VMX，不过这也没关系.\r\n"));
-        //return FALSE;
+        KdPrint(("SMX not supported, OK.\r\n"));
     }
 
     b = _bittest64(&FeatureControlMsr, 2);
@@ -411,13 +364,6 @@ https://msdn.microsoft.com/en-us/library/h65k4tze.aspx
 
 
 BOOL is_support_vmx()
-/*
-功能：判断CPU是否支持VMX指令。
-权威资料：23.6 DISCOVERING SUPPORT FOR VMX
-
-System software can determine whether a processor supports VMX operation using CPUID.
-If CPUID.1:ECX.VMX[bit 5] = 1, then VMX operation is supported.
-*/
 {
     int CPUInfo[4] = {-1};
 
@@ -437,11 +383,7 @@ BOOL is_support_intel()
     char CPUString[0x20];
     int CPUInfo[4] = {-1};
 
-    // __cpuid with an InfoType argument of 0 returns the number of valid Ids in CPUInfo[0] and the CPU identification string in the other three array elements.
-    // The CPU identification string is not in linear order. 
-    // The code below arranges the information in a human readable form.
     __cpuid(CPUInfo, 0);
-    //unsigned nIds = CPUInfo[0];
     memset(CPUString, 0, sizeof(CPUString));
     *((int *)CPUString) = CPUInfo[1];
     *((int *)(CPUString + 4)) = CPUInfo[3];
@@ -456,24 +398,15 @@ BOOL is_support_intel()
 
 
 BOOL is_support_cpuid()
-/*
-判断CPU是否支持CPUID指令。
-
-The ID flag (bit 21) in the EFLAGS register indicates support for the CPUID instruction.
-If a software procedure can set and clear this flag, the processor executing the procedure supports the CPUID instruction.
-This instruction operates the same in non-64-bit modes and 64-bit mode.
-*/
 {
-    SIZE_T original = __readeflags(); //读取
+    SIZE_T original = __readeflags();
 
-    // 尝试翻转第 21 位
     SIZE_T flipped = original ^ 0x200000;
 
     __writeeflags(flipped);
     SIZE_T readback = __readeflags();
-    __writeeflags(original); // 恢复
+    __writeeflags(original);
 
-    // 检查第 21 位是否已改变
     if ((readback ^ original) & 0x200000) {
         return TRUE;
     }
@@ -488,21 +421,51 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 
     ULONG numProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     for (ULONG i = 0; i < numProcs; i++) {
+        if (i >= MAX_CPU_COUNT || !g_CpuContext[i].Launched) {
+            continue;
+        }
+
         PROCESSOR_NUMBER procNumber;
         KeGetProcessorNumberFromIndex(i, &procNumber);
-        
+
         GROUP_AFFINITY affinity = {0};
         affinity.Group = procNumber.Group;
         affinity.Mask = (KAFFINITY)1 << procNumber.Number;
-        
+
         GROUP_AFFINITY oldAffinity;
         KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
-        
+
         KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
         VmxVmCall(NBP_HYPERCALL_UNLOAD);
         KeLowerIrql(OldIrql);
-        
+
         KeRevertToUserGroupAffinityThread(&oldAffinity);
+
+        // VMCALL 通过 Trampoline 返回后，VMX 已关闭
+        // 注意：Trampoline 页故意不释放（正在执行中的代码页不能释放）
+        // 以下资源可以安全释放
+        if (g_CpuContext[i].VmxonRegion) {
+            MmFreeContiguousMemory(g_CpuContext[i].VmxonRegion);
+        }
+        if (g_CpuContext[i].VmcsRegion) {
+            MmFreeContiguousMemory(g_CpuContext[i].VmcsRegion);
+        }
+        if (g_CpuContext[i].HostStack) {
+            ExFreePool(g_CpuContext[i].HostStack);
+        }
+        if (g_CpuContext[i].IOBitmapA) {
+            MmFreeContiguousMemory(g_CpuContext[i].IOBitmapA);
+        }
+        if (g_CpuContext[i].IOBitmapB) {
+            MmFreeContiguousMemory(g_CpuContext[i].IOBitmapB);
+        }
+        if (g_CpuContext[i].MSRBitmap) {
+            MmFreeContiguousMemory(g_CpuContext[i].MSRBitmap);
+        }
+        // TrampolinePage 故意泄漏 — 它是 IRETQ 返回后仍在执行的代码页
+        // 释放它会导致 page fault 蓝屏
+
+        g_CpuContext[i].Launched = FALSE;
     }
 }
 
@@ -534,18 +497,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_NOT_SUPPORTED;
     }
 
+    RtlZeroMemory(g_CpuContext, sizeof(g_CpuContext));
+
     ULONG numProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     for (ULONG i = 0; i < numProcs; i++) {
         PROCESSOR_NUMBER procNumber;
         KeGetProcessorNumberFromIndex(i, &procNumber);
-        
+
         GROUP_AFFINITY affinity = {0};
         affinity.Group = procNumber.Group;
         affinity.Mask = (KAFFINITY)1 << procNumber.Number;
-        
+
         GROUP_AFFINITY oldAffinity;
         KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
-        
+
         KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
         NTSTATUS Status = CmSubvert();
         KeLowerIrql(OldIrql);
@@ -553,7 +518,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
         if (!NT_SUCCESS(Status)) {
             KdPrint(("CmSubvert failed on processor %d with status 0x%x\n", i, Status));
-            // TODO: 回滚已成功的 CPU 上的 Hypervisor
             return Status;
         }
     }

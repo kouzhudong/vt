@@ -24,7 +24,7 @@ NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Regi
     case REG_CONTROL:
         uCodeLength = *pGeneratedCodeLength;
         CmGenerateMovReg(pCode, pGeneratedCodeLength, REG_RAX, Value);
-        uCodeLength = *pGeneratedCodeLength - uCodeLength;// calc the size of the "mov rax, value"
+        uCodeLength = *pGeneratedCodeLength - uCodeLength;
         pCode += uCodeLength;
         uCodeLength = 0;
 
@@ -38,7 +38,7 @@ NTSTATUS  CmGenerateMovReg(PUCHAR pCode, PULONG pGeneratedCodeLength, ULONG Regi
         pCode[0] = 0x0f;
         pCode[1] = 0x22;
         pCode[2] = 0xc0 | (UCHAR)((Register & REG_MASK) << 3);
-        uCodeLength += 3;// *pGeneratedCodeLength has already been adjusted to the length of the "mov rax"
+        uCodeLength += 3;
         break;
     default:
         return STATUS_NOT_SUPPORTED;
@@ -77,31 +77,22 @@ NTSTATUS  CmGenerateIretq(PUCHAR pCode, PULONG pGeneratedCodeLength)
     return STATUS_SUCCESS;
 }
 
-// Helper to write descriptor table instructions (LGDT/LIDT)
-// Opcode: 2 for LGDT (0F 01 /2), 3 for LIDT (0F 01 /3)
+
 VOID CmGenerateDescTableLoad(PUCHAR Trampoline, PULONG pOffset, UCHAR SubOpcode, ULONG DataOffsetRelative)
 {
     PUCHAR pCode = &Trampoline[*pOffset];
-    // 0F 01 /n [RIP + offset]
-    // ModRM: mod=00, reg=SubOpcode, rm=101 (RIP-relative) -> no, 64-bit uses mod 00 rm 101 as RIP-rel
-    
+
     pCode[0] = 0x0F;
     pCode[1] = 0x01;
-    // ModRM byte encoded:
-    // Mod=00 (00b), Reg=SubOpcode (010b or 011b), RM=101 (101b for RIP rel 32 DISP)
-    // For LGDT (2): 00 010 101 = 0x15
-    // For LIDT (3): 00 011 101 = 0x1D
-    pCode[2] = (SubOpcode == 2) ? 0x15 : 0x1D; 
-    
-    // Offset calculation: Target - (CurrentIP + InstructionLength)
-    // InstructionLength = 3 (opcode+modrm) + 4 (disp) = 7
+    pCode[2] = (SubOpcode == 2) ? 0x15 : 0x1D;
+
     ULONG32 displacement = DataOffsetRelative - (*pOffset + 7);
     memcpy(&pCode[3], &displacement, 4);
-    
+
     *pOffset += 7;
 }
 
-// Helper for WRMSR (0F 30). Expects ECX, EDX:EAX to be set.
+
 VOID CmGenerateWrmsr(PUCHAR Trampoline, PULONG pOffset)
 {
     PUCHAR pCode = &Trampoline[*pOffset];
@@ -110,13 +101,49 @@ VOID CmGenerateWrmsr(PUCHAR Trampoline, PULONG pOffset)
     *pOffset += 2;
 }
 
-// Helper for LTR r16 (0F 00 /3). Uses AX (register 0).
+
 VOID CmGenerateLtrAx(PUCHAR Trampoline, PULONG pOffset)
 {
     PUCHAR pCode = &Trampoline[*pOffset];
     pCode[0] = 0x0F;
     pCode[1] = 0x00;
-    pCode[2] = 0xD8; // ModRM: 11 011 000 (Register mode, LTR, AX)
+    pCode[2] = 0xD8;
+    *pOffset += 3;
+}
+
+
+// =====================================================================
+// 关键修复：在 Trampoline 中生成清除 TSS Busy 位的代码
+// 
+// LTR 指令要求 TSS 描述符的 Type 为 0x9 (Available 64-bit TSS)。
+// 但当前 CPU 的 TSS 已经是 0xB (Busy 64-bit TSS)。
+// 如果直接 LTR，会触发 #GP。
+// 
+// 解决方案：在 LGDT 之后、LTR 之前，用代码修改 GDT 中 TSS 描述符的
+// Type 字段，将 Busy 位 (bit 1) 清除。
+//
+// GDT 中 TSS 描述符偏移 = TR_Selector & ~0x7
+// Type 字段位于描述符偏移 +5 字节的低 4 位
+// Busy 位 = byte[5] 的 bit 1
+//
+// 生成的代码序列 (使用 RAX 作为 scratch):
+//   mov rax, <GDTR_BASE + TR_SELECTOR_INDEX + 5>
+//   and byte [rax], 0xFD   ; 清除 bit 1 (Busy)
+// =====================================================================
+VOID CmGenerateClearTssBusy(PUCHAR Trampoline, PULONG pOffset, ULONG64 GdtBase, ULONG64 TrSelector)
+{
+    // 计算 TSS 描述符中 Type 字节的地址
+    ULONG64 TssTypeByteAddr = GdtBase + (TrSelector & ~7ULL) + 5;
+
+    // mov rax, imm64
+    CmGenerateMovReg(&Trampoline[*pOffset], pOffset, REG_RAX, TssTypeByteAddr);
+
+    // and byte [rax], 0xFD  =>  80 20 FD  =>  实际是 80 /4 ib => and [rax], 0xFD
+    // 编码: 80 20 FD
+    PUCHAR pCode = &Trampoline[*pOffset];
+    pCode[0] = 0x80;   // AND r/m8, imm8
+    pCode[1] = 0x20;   // ModRM: mod=00, reg=4(/4=AND), rm=0(RAX)
+    pCode[2] = 0xFD;   // ~0x02, 清除 bit 1
     *pOffset += 3;
 }
 
@@ -124,12 +151,8 @@ VOID CmGenerateLtrAx(PUCHAR Trampoline, PULONG pOffset)
 VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
 {
     ULONG uSize = 0;
-    ULONG uDataOffset = 0x800; // Place data (GDT/IDT descriptors) further down in the page
-    
-    // Store GDT/IDT pseudo-descriptors in the data area
-    // struct { USHORT Limit; ULONG64 Base; }
-    // GDT at uDataOffset, IDT at uDataOffset + 10
-    
+    ULONG uDataOffset = 0x800;
+
     USHORT gdtLimit = (USHORT)VmxRead(GUEST_GDTR_LIMIT);
     ULONG64 gdtBase = VmxRead(GUEST_GDTR_BASE);
     memcpy(&Trampoline[uDataOffset], &gdtLimit, 2);
@@ -140,52 +163,40 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
     memcpy(&Trampoline[uDataOffset + 10], &idtLimit, 2);
     memcpy(&Trampoline[uDataOffset + 12], &idtBase, 8);
 
-    // Disable TF in Guest RFLAGS before exit
     __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & ~0x100);
 
-    // 1. Restore CR0 and CR4 first (sets machine state for subsequent loads)
+    // 1. 恢复 CR0
     CmGenerateMovReg(Trampoline, &uSize, REG_CR0, VmxRead(GUEST_CR0));
-    
-    // CR4: Ensure Safe (clear SMAP to allow stack switching if guest stack is user, clear VMXE implicitly irrelevant after off)
-    ULONG64 GuestCr4 = VmxRead(GUEST_CR4);
-    CmGenerateMovReg(Trampoline, &uSize, REG_CR4, GuestCr4 & ~0x200000ULL);
 
-    // 2. Restore CR3 (Context Switch)
-    // Code sequence MUST be mapped in the target CR3 (Kernel pool is usually shared)
+    // 2. 恢复 CR4 — 仅清除 VMXE (bit 13)，保留 SMAP 等其他位
+    ULONG64 GuestCr4 = VmxRead(GUEST_CR4);
+    CmGenerateMovReg(Trampoline, &uSize, REG_CR4, GuestCr4 & ~X86_CR4_VMXE);
+
+    // 3. 恢复 CR3
     CmGenerateMovReg(Trampoline, &uSize, REG_CR3, VmxRead(GUEST_CR3));
 
-    // 3. Restore GDT and IDT (Crucial for IRETQ and Segment loads)
-    CmGenerateDescTableLoad(Trampoline, &uSize, 2, uDataOffset);      // LGDT
-    CmGenerateDescTableLoad(Trampoline, &uSize, 3, uDataOffset + 10); // LIDT
+    // 4. 恢复 GDT 和 IDT
+    CmGenerateDescTableLoad(Trampoline, &uSize, 2, uDataOffset);
+    CmGenerateDescTableLoad(Trampoline, &uSize, 3, uDataOffset + 10);
 
-    // 4. Restore TR (Task Register) - Requires valid GDT
-    // Load Selector into RAX, then LTR AX
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, VmxRead(GUEST_TR_SELECTOR));
+    // 5. 清除 TSS Busy 位，然后 LTR
+    ULONG64 TrSelector = VmxRead(GUEST_TR_SELECTOR);
+    CmGenerateClearTssBusy(Trampoline, &uSize, gdtBase, TrSelector);
+    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, TrSelector);
     CmGenerateLtrAx(Trampoline, &uSize);
 
-    // 5. Restore MSRs (FS/GS/KernelGS) - Uses RCX, RAX, RDX. Clobbers them.
-    // Must occur BEFORE GPR restoration.
-    
-    // MSR_FS_BASE
+    // 6. 恢复 FS/GS MSR
     CmGenerateMovReg(Trampoline, &uSize, REG_RCX, 0xC0000100);
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, (VmxRead(GUEST_FS_BASE) & 0xFFFFFFFF));
     CmGenerateMovReg(Trampoline, &uSize, REG_RDX, (VmxRead(GUEST_FS_BASE) >> 32));
     CmGenerateWrmsr(Trampoline, &uSize);
 
-    // MSR_GS_BASE
     CmGenerateMovReg(Trampoline, &uSize, REG_RCX, 0xC0000101);
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, (VmxRead(GUEST_GS_BASE) & 0xFFFFFFFF));
     CmGenerateMovReg(Trampoline, &uSize, REG_RDX, (VmxRead(GUEST_GS_BASE) >> 32));
     CmGenerateWrmsr(Trampoline, &uSize);
 
-    // MSR_KERNEL_GS_BASE (0xC0000102) - Assuming we can assume it's valid or zero.
-    // If we don't restore this, SwapGS in guest kernel entry will load garbage.
-    // However, finding the field requires reading the MSR while in VMX root or MSR bitmaps?
-    // Generally, GUEST stores it. If not available in VMCS, we might skip or read via Rdmsr if needed.
-    // Proceeding without KernelGSBase for now to avoid invalid VMCS reads if index unknown in h.h context.
-
-    // 6. Restore GPRs (Restores GuestRegs values into CPU registers)
-    // NOTE: RAX is NOT restored here because we still need it for stack setup.
+    // 7. 恢复通用寄存器 (RAX 最后恢复)
     CmGenerateMovReg(Trampoline, &uSize, REG_RCX, GuestRegs->rcx);
     CmGenerateMovReg(Trampoline, &uSize, REG_RDX, GuestRegs->rdx);
     CmGenerateMovReg(Trampoline, &uSize, REG_RBX, GuestRegs->rbx);
@@ -202,76 +213,60 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
     CmGenerateMovReg(Trampoline, &uSize, REG_R14, GuestRegs->r14);
     CmGenerateMovReg(Trampoline, &uSize, REG_R15, GuestRegs->r15);
 
-    // 7. Switch Stack to Guest RSP
-    ULONG64 NewRsp = VmxRead(GUEST_RSP);
+    // 8. 调整 Guest RSP 预留 IRETQ 帧空间 (5 * 8 = 40 字节)
+    // 这样 push 操作不会覆盖 Guest 原有栈数据
+    ULONG64 GuestRsp = VmxRead(GUEST_RSP);
+    ULONG64 NewRsp = GuestRsp - 40;
     CmGenerateMovReg(Trampoline, &uSize, REG_RSP, NewRsp);
 
-    // 8. Build IRETQ Stack Frame on the GUEST Stack
-    // Frame: SS, RSP, RFLAGS, CS, RIP
-    // We use RAX as scratch to push these values.
-    
-    // SS
+    // 9. 构建 IRETQ 栈帧: SS, RSP, RFLAGS, CS, RIP (从高地址到低地址 push)
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, VmxRead(GUEST_SS_SELECTOR));
     CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
-    
-    // RSP (The value we just loaded into RSP register is the *current* stack pointer.
-    // IRETQ expects the RSP to restore *after* return. 
-    // Usually same as current if no privilege change, but we must match the frame logic.
-    // Since we are already on NewRsp, pushing NewRsp is redundant if same priv, but required by IRETQ format.)
-    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, NewRsp);
+
+    CmGenerateMovReg(Trampoline, &uSize, REG_RAX, GuestRsp);
     CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
-    
-    // RFLAGS
+
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, VmxRead(GUEST_RFLAGS));
     CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
-    
-    // CS
+
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, VmxRead(GUEST_CS_SELECTOR));
     CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
-    
-    // RIP
+
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, VmxRead(GUEST_RIP) + VmxRead(VM_EXIT_INSTRUCTION_LEN));
     CmGeneratePushReg(Trampoline, &uSize, REG_RAX);
 
-    // 9. Restore Guest RAX (Last register)
+    // 10. 恢复 RAX
     CmGenerateMovReg(Trampoline, &uSize, REG_RAX, GuestRegs->rax);
 
-    // 10. Execute IRETQ
-    // This will pop RIP, CS, RFLAGS, RSP, SS and transfer control to guest code.
-    // Since we restored GDTR/IDTR/CR3, the environment is valid.
+    // 11. IRETQ
     CmGenerateIretq(Trampoline, &uSize);
 }
 
 
 VOID reset_cr4()
-//设置CR4的一个位。
-{    
+{
     unsigned __int64 cr4 = __readcr4();
-
-    // VMX-Enable Bit (bit 13 of CR4) — Enables VMX operation when set
-    // Also clear SMAP (bit 21) if present to safely write to guest stack if it is user-mode.
-    // 0x2000 = 1 << 13
-    // 0x200000 = 1 << 21
-    cr4 = cr4 & (~(0x2000ULL | 0x200000ULL));
-
+    // 仅清除 VMXE (bit 13)，不要动 SMAP (bit 21) 等其他位
+    cr4 = cr4 & ~0x2000ULL;
     __writecr4(cr4);
 }
 
 
-NTSTATUS VmxShutdown(PGUEST_REGS GuestRegs)
+VOID VmxShutdown(PGUEST_REGS GuestRegs)
 {
-    // 使用 ExAllocatePool2 替代已弃用的 ExAllocatePoolWithTag
-    // POOL_FLAG_NON_PAGED: 非分页内存 (可执行)
-    // 注意: ExAllocatePool2 分配的 NonPaged 内存默认是 NX 的，
-    // 但 POOL_FLAG_NON_PAGED 在某些版本上仍映射为可执行。
-    // 为确保可执行，使用 NonPagedPool (旧API) 或 MmAllocateContiguousMemory。
-    PUCHAR Trampoline = (PUCHAR)MmAllocateContiguousMemory(0x1000, (PHYSICAL_ADDRESS){.QuadPart = -1});
+    // 获取当前 CPU 编号，使用预分配的 Trampoline 页
+    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
+    PUCHAR Trampoline = (PUCHAR)g_CpuContext[cpuIndex].TrampolinePage;
 
     if (!Trampoline) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        // 没有预分配的页面，无法安全卸载 — 直接 VMXOFF 后返回
+        // Guest 会在 VMCALL 下一条指令处继续，但状态可能不完整
+        __vmx_off();
+        reset_cr4();
+        return;
     }
 
-    RtlZeroMemory(Trampoline, 0x1000);
+    RtlZeroMemory(Trampoline, PAGE_SIZE);
 
     VmxGenerateTrampolineToGuest(GuestRegs, Trampoline);
 
@@ -279,17 +274,17 @@ NTSTATUS VmxShutdown(PGUEST_REGS GuestRegs)
     reset_cr4();
 
     ((VOID(*)()) Trampoline) ();
-    return STATUS_SUCCESS; // never returns
+    // 永远不会返回
 }
 
 
-NTSTATUS NTAPI HvmResumeGuest() //汇编函数CmGuestEip调用。
+NTSTATUS NTAPI HvmResumeGuest()
 {
     return STATUS_SUCCESS;
 }
 
 
-VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引用
+VOID VmExitHandler(PGUEST_REGS GuestRegs)
 {
     ULONG64 ExitReason;
     ULONG_PTR GuestEIP;
@@ -304,20 +299,16 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
     __vmx_vmread(VM_EXIT_INSTRUCTION_LEN, &inst_len);
 
     switch (ExitReason) {
-    case EXIT_REASON_CPUID://CPU-Z总是有些信息显示不出来。不过兼容自己写的几个程序。
+    case EXIT_REASON_CPUID:
     {
         int CPUInfo[4] = {-1};
 
         __cpuidex(CPUInfo, (int)GuestRegs->rax, (int)GuestRegs->rcx);
-        //__cpuid(CPUInfo, (int)GuestRegs->rax);
-        if (GuestRegs->rax == 0) {//返回MadeByCorrey
+        if (GuestRegs->rax == 0) {
             GuestRegs->rax = CPUInfo[0];
             GuestRegs->rbx = 'edaM';
             GuestRegs->rcx = 'yerr';
             GuestRegs->rdx = 'oCyB';
-            //GuestRegs->rbx = CPUInfo[1];
-            //GuestRegs->rcx = CPUInfo[3];
-            //GuestRegs->rdx = CPUInfo[2];
         } else {
             GuestRegs->rax = CPUInfo[0];
             GuestRegs->rbx = CPUInfo[1];
@@ -331,14 +322,13 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
         ULONG32 HypercallNumber = (ULONG32)(GuestRegs->rcx & 0xffff);
         switch (HypercallNumber) {
         case NBP_HYPERCALL_UNLOAD:
+            // VmxShutdown 不再分配内存，直接使用预分配页
+            // 如果成功，它会跳转到 Trampoline 永远不返回
+            VmxShutdown(GuestRegs);
+            // 如果到达这里，说明 Trampoline 为 NULL（回退路径）
+            // 设置返回值让调用方知道卸载已完成
             GuestRegs->rcx = NBP_MAGIC;
             GuestRegs->rdx = 0;
-            // VmxShutdown now returns status if allocation fails
-            if (!NT_SUCCESS(VmxShutdown(GuestRegs))) {
-                // If shutdown failed, we fall through and just return from hypercall normally
-                break;
-            }
-            // If shutdown succeeds, it jumps to trampoline and never returns here.
             break;
         default:
             break;
@@ -370,12 +360,11 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
     break;
     case EXIT_REASON_MSR_READ:
     {
-        //size_t FieldValue = 0;
         LARGE_INTEGER MsrValue;
         ULONG32 rcx = (ULONG32)GuestRegs->rcx;
         switch (rcx) {
         case MSR_IA32_SYSENTER_CS:
-            MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_CS);//这几个改为__vmx_vmread有问题。
+            MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_CS);
             break;
         case MSR_IA32_SYSENTER_ESP:
             MsrValue.QuadPart = VmxRead(GUEST_SYSENTER_ESP);
@@ -444,13 +433,8 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)//在函数 VmxVmexitHandler 中被引�
         GuestRegs->rcx = Aux;
     }
     break;
-    //(ExitReason >= EXIT_REASON_VMCLEAR && ExitReason <= EXIT_REASON_VMXON)
-    //{
-    //    __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & (~0x8d5) | 0x1);
-    //}
     default:
     {
-        //KdPrint (("VmExitHandler(): failed for exitcode 0x%llX\n", ExitReason));
         ULONG64 x = ExitReason;
         x = 0;
     }
