@@ -63,7 +63,6 @@ SIZE_T get_segments_access_right(SIZE_T segment_registers)
 }
 
 
-// 分配连续物理内存并返回物理地址。同时通过 ppVA 返回虚拟地址供后续释放。
 PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPagesEx(PVOID *ppVA)
 {
     PHYSICAL_ADDRESS l1, l2, l3;
@@ -85,7 +84,7 @@ PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPagesEx(PVOID *ppVA)
     }
 }
 
-// 保持旧接口兼容
+
 PHYSICAL_ADDRESS NTAPI MmAllocateContiguousPages()
 {
     return MmAllocateContiguousPagesEx(NULL);
@@ -143,7 +142,6 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
     __vmx_vmwrite(EXCEPTION_BITMAP, 0);
 
-    // Guest State Area
     __vmx_vmwrite(GUEST_ES_SELECTOR, RegGetEs());
     __vmx_vmwrite(GUEST_CS_SELECTOR, RegGetCs());
     __vmx_vmwrite(GUEST_SS_SELECTOR, RegGetSs());
@@ -196,7 +194,6 @@ VOID SetVMCS(SIZE_T HostRsp, SIZE_T GuestRsp)
 
     __vmx_vmwrite(GUEST_IA32_DEBUGCTL, __readmsr(MSR_IA32_DEBUGCTL));
 
-    // Host State Area
     __vmx_vmwrite(HOST_CS_SELECTOR, get_segment_selector(RegGetCs()));
     __vmx_vmwrite(HOST_DS_SELECTOR, get_segment_selector(RegGetDs()));
     __vmx_vmwrite(HOST_ES_SELECTOR, get_segment_selector(RegGetEs()));
@@ -272,7 +269,6 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(Stack, 2 * PAGE_SIZE);
 
-    // 预分配 Trampoline 页（必须可执行，用 MmAllocateContiguousMemory）
     PVOID TrampolinePage = MmAllocateContiguousMemory(PAGE_SIZE, (PHYSICAL_ADDRESS){.QuadPart = -1});
     if (TrampolinePage == NULL) {
         ExFreePool(Stack);
@@ -282,7 +278,6 @@ NTSTATUS HvmSubvertCpu()
     }
     RtlZeroMemory(TrampolinePage, PAGE_SIZE);
 
-    // 保存到全局上下文，供卸载时使用
     g_CpuContext[cpuIndex].VmxonRegion = VmxonR;
     g_CpuContext[cpuIndex].VmcsRegion = Vmcs;
     g_CpuContext[cpuIndex].HostStack = Stack;
@@ -415,35 +410,47 @@ BOOL is_support_cpuid()
 }
 
 
+#pragma warning(push)
+#pragma warning(disable : 6387) // KeGenericCallDpc 保证 SystemArgument1/2 非 NULL
+static VOID UnloadDpcRoutine(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
+
+    if (cpuIndex < MAX_CPU_COUNT && g_CpuContext[cpuIndex].Launched) {
+        VmxVmCall(NBP_HYPERCALL_UNLOAD);
+    }
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+#pragma warning(pop)
+
+
+#pragma warning(push)
+#pragma warning(disable : 6001) // g_CpuContext 在 HvmSubvertCpu 中已初始化，分析器无法跨函数追踪
 VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    KeGenericCallDpc(UnloadDpcRoutine, NULL);
+
     ULONG numProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    for (ULONG i = 0; i < numProcs; i++) {
-        if (i >= MAX_CPU_COUNT || !g_CpuContext[i].Launched) {
+    for (ULONG i = 0; i < numProcs && i < MAX_CPU_COUNT; i++) {
+        if (!g_CpuContext[i].VmxonRegion) {
             continue;
         }
 
-        PROCESSOR_NUMBER procNumber;
-        KeGetProcessorNumberFromIndex(i, &procNumber);
-
-        GROUP_AFFINITY affinity = {0};
-        affinity.Group = procNumber.Group;
-        affinity.Mask = (KAFFINITY)1 << procNumber.Number;
-
-        GROUP_AFFINITY oldAffinity;
-        KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
-
-        KIRQL OldIrql = KeRaiseIrqlToDpcLevel();
-        VmxVmCall(NBP_HYPERCALL_UNLOAD);
-        KeLowerIrql(OldIrql);
-
-        KeRevertToUserGroupAffinityThread(&oldAffinity);
-
-        // VMCALL 通过 Trampoline 返回后，VMX 已关闭
-        // 注意：Trampoline 页故意不释放（正在执行中的代码页不能释放）
-        // 以下资源可以安全释放
+        if (g_CpuContext[i].TrampolinePage) {
+            MmFreeContiguousMemory(g_CpuContext[i].TrampolinePage);
+        }
         if (g_CpuContext[i].VmxonRegion) {
             MmFreeContiguousMemory(g_CpuContext[i].VmxonRegion);
         }
@@ -462,12 +469,11 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
         if (g_CpuContext[i].MSRBitmap) {
             MmFreeContiguousMemory(g_CpuContext[i].MSRBitmap);
         }
-        // TrampolinePage 故意泄漏 — 它是 IRETQ 返回后仍在执行的代码页
-        // 释放它会导致 page fault 蓝屏
 
-        g_CpuContext[i].Launched = FALSE;
+        RtlZeroMemory(&g_CpuContext[i], sizeof(VMX_CPU_CONTEXT));
     }
 }
+#pragma warning(pop)
 
 
 DRIVER_INITIALIZE DriverEntry;

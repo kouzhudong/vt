@@ -409,19 +409,17 @@ typedef union _VMX_CPU_BASED_CONTROLS
 #define REG_CR4	REG_CONTROL | 4
 #define REG_CR8	REG_CONTROL | 8
 
-// 每个 CPU 的 VMX 上下文，用于安全卸载
 typedef struct _VMX_CPU_CONTEXT {
-    PVOID  VmxonRegion;       // VMXON region 虚拟地址
-    PVOID  VmcsRegion;        // VMCS region 虚拟地址
-    PVOID  HostStack;         // Host 栈
-    PVOID  TrampolinePage;    // 预分配的 Trampoline 可执行页
-    PVOID  IOBitmapA;         // IO Bitmap A 虚拟地址
-    PVOID  IOBitmapB;         // IO Bitmap B 虚拟地址
-    PVOID  MSRBitmap;         // MSR Bitmap 虚拟地址
-    BOOLEAN Launched;         // 此 CPU 是否已 VMLAUNCH
+    PVOID  VmxonRegion;
+    PVOID  VmcsRegion;
+    PVOID  HostStack;
+    PVOID  TrampolinePage;
+    PVOID  IOBitmapA;
+    PVOID  IOBitmapB;
+    PVOID  MSRBitmap;
+    BOOLEAN Launched;
 } VMX_CPU_CONTEXT, *PVMX_CPU_CONTEXT;
 
-// 全局 per-CPU 上下文数组（最多支持 256 个处理器）
 #define MAX_CPU_COUNT 256
 extern VMX_CPU_CONTEXT g_CpuContext[MAX_CPU_COUNT];
 
@@ -442,3 +440,23 @@ NTSTATUS  CmSubvert ();
 NTSTATUS  CmGuestEip (PVOID);
 VOID GetCpuIdInfo (ULONG32 fn, OUT PULONG32 ret_eax, OUT PULONG32 ret_ebx, OUT PULONG32 ret_ecx, OUT PULONG32 ret_edx);
 size_t get_access_rights(size_t x);
+
+// WDK 头文件中可能未导出的 DPC 广播函数声明
+NTKERNELAPI
+VOID
+KeGenericCallDpc(
+    _In_ PKDEFERRED_ROUTINE Routine,
+    _In_opt_ PVOID Context
+);
+
+NTKERNELAPI
+VOID
+KeSignalCallDpcDone(
+    _In_ PVOID SystemArgument1
+);
+
+NTKERNELAPI
+LOGICAL
+KeSignalCallDpcSynchronize(
+    _In_ PVOID SystemArgument2
+);

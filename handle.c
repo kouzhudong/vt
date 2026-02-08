@@ -112,38 +112,31 @@ VOID CmGenerateLtrAx(PUCHAR Trampoline, PULONG pOffset)
 }
 
 
-// =====================================================================
-// 关键修复：在 Trampoline 中生成清除 TSS Busy 位的代码
-// 
-// LTR 指令要求 TSS 描述符的 Type 为 0x9 (Available 64-bit TSS)。
-// 但当前 CPU 的 TSS 已经是 0xB (Busy 64-bit TSS)。
-// 如果直接 LTR，会触发 #GP。
-// 
-// 解决方案：在 LGDT 之后、LTR 之前，用代码修改 GDT 中 TSS 描述符的
-// Type 字段，将 Busy 位 (bit 1) 清除。
-//
-// GDT 中 TSS 描述符偏移 = TR_Selector & ~0x7
-// Type 字段位于描述符偏移 +5 字节的低 4 位
-// Busy 位 = byte[5] 的 bit 1
-//
-// 生成的代码序列 (使用 RAX 作为 scratch):
-//   mov rax, <GDTR_BASE + TR_SELECTOR_INDEX + 5>
-//   and byte [rax], 0xFD   ; 清除 bit 1 (Busy)
-// =====================================================================
 VOID CmGenerateClearTssBusy(PUCHAR Trampoline, PULONG pOffset, ULONG64 GdtBase, ULONG64 TrSelector)
 {
-    // 计算 TSS 描述符中 Type 字节的地址
     ULONG64 TssTypeByteAddr = GdtBase + (TrSelector & ~7ULL) + 5;
 
-    // mov rax, imm64
     CmGenerateMovReg(&Trampoline[*pOffset], pOffset, REG_RAX, TssTypeByteAddr);
 
-    // and byte [rax], 0xFD  =>  80 20 FD  =>  实际是 80 /4 ib => and [rax], 0xFD
-    // 编码: 80 20 FD
     PUCHAR pCode = &Trampoline[*pOffset];
-    pCode[0] = 0x80;   // AND r/m8, imm8
-    pCode[1] = 0x20;   // ModRM: mod=00, reg=4(/4=AND), rm=0(RAX)
-    pCode[2] = 0xFD;   // ~0x02, 清除 bit 1
+    pCode[0] = 0x80;
+    pCode[1] = 0x20;
+    pCode[2] = 0xFD;
+    *pOffset += 3;
+}
+
+
+// =====================================================================
+// 在 Trampoline 中生成 vmxoff 指令
+// 这样 vmxoff 在 Trampoline 页的地址空间中执行，
+// 而不是在即将被卸载的 test.sys 地址空间中。
+// =====================================================================
+VOID CmGenerateVmxOff(PUCHAR Trampoline, PULONG pOffset)
+{
+    PUCHAR pCode = &Trampoline[*pOffset];
+    pCode[0] = 0x0F;  // vmxoff = 0F 01 C4
+    pCode[1] = 0x01;
+    pCode[2] = 0xC4;
     *pOffset += 3;
 }
 
@@ -165,12 +158,16 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
 
     __vmx_vmwrite(GUEST_RFLAGS, VmxRead(GUEST_RFLAGS) & ~0x100);
 
-    // 1. 恢复 CR0
-    CmGenerateMovReg(Trampoline, &uSize, REG_CR0, VmxRead(GUEST_CR0));
+    // 0. VMXOFF — 必须在 VMX root operation 中执行，放在 Trampoline 最前面
+    //    这确保 vmxoff 后续的 CR 修改不再触发嵌套 VT-x 层的 VM-Exit
+    CmGenerateVmxOff(Trampoline, &uSize);
 
-    // 2. 恢复 CR4 — 仅清除 VMXE (bit 13)，保留 SMAP 等其他位
+    // 1. 恢复 CR4 — 清除 VMXE (bit 13)，必须在 vmxoff 之后立即执行
     ULONG64 GuestCr4 = VmxRead(GUEST_CR4);
     CmGenerateMovReg(Trampoline, &uSize, REG_CR4, GuestCr4 & ~X86_CR4_VMXE);
+
+    // 2. 恢复 CR0
+    CmGenerateMovReg(Trampoline, &uSize, REG_CR0, VmxRead(GUEST_CR0));
 
     // 3. 恢复 CR3
     CmGenerateMovReg(Trampoline, &uSize, REG_CR3, VmxRead(GUEST_CR3));
@@ -214,7 +211,6 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
     CmGenerateMovReg(Trampoline, &uSize, REG_R15, GuestRegs->r15);
 
     // 8. 调整 Guest RSP 预留 IRETQ 帧空间 (5 * 8 = 40 字节)
-    // 这样 push 操作不会覆盖 Guest 原有栈数据
     ULONG64 GuestRsp = VmxRead(GUEST_RSP);
     ULONG64 NewRsp = GuestRsp - 40;
     CmGenerateMovReg(Trampoline, &uSize, REG_RSP, NewRsp);
@@ -246,7 +242,6 @@ VOID VmxGenerateTrampolineToGuest(PGUEST_REGS GuestRegs, PUCHAR Trampoline)
 VOID reset_cr4()
 {
     unsigned __int64 cr4 = __readcr4();
-    // 仅清除 VMXE (bit 13)，不要动 SMAP (bit 21) 等其他位
     cr4 = cr4 & ~0x2000ULL;
     __writecr4(cr4);
 }
@@ -254,13 +249,10 @@ VOID reset_cr4()
 
 VOID VmxShutdown(PGUEST_REGS GuestRegs)
 {
-    // 获取当前 CPU 编号，使用预分配的 Trampoline 页
     ULONG cpuIndex = KeGetCurrentProcessorNumberEx(NULL);
     PUCHAR Trampoline = (PUCHAR)g_CpuContext[cpuIndex].TrampolinePage;
 
     if (!Trampoline) {
-        // 没有预分配的页面，无法安全卸载 — 直接 VMXOFF 后返回
-        // Guest 会在 VMCALL 下一条指令处继续，但状态可能不完整
         __vmx_off();
         reset_cr4();
         return;
@@ -268,13 +260,31 @@ VOID VmxShutdown(PGUEST_REGS GuestRegs)
 
     RtlZeroMemory(Trampoline, PAGE_SIZE);
 
+    // 生成 Trampoline 代码 — 内含 vmxoff 指令
     VmxGenerateTrampolineToGuest(GuestRegs, Trampoline);
 
-    __vmx_off();
-    reset_cr4();
+    // 不在这里执行 __vmx_off() — vmxoff 已经被编码到 Trampoline 中
+    // 也不在这里执行 reset_cr4() — CR4 恢复已在 Trampoline 中
 
-    ((VOID(*)()) Trampoline) ();
-    // 永远不会返回
+    // 使用 vmresume 切换到 Guest 模式执行 Trampoline
+    // 将 GUEST_RIP 指向 Trampoline 页，让 VM 以 Guest 身份执行它
+    // Trampoline 的第一条指令就是 vmxoff
+    __vmx_vmwrite(GUEST_RIP, (SIZE_T)Trampoline);
+    __vmx_vmwrite(GUEST_RSP, VmxRead(GUEST_RSP));
+
+    // 清除 CR0/CR4 guest-host mask，这样 Trampoline 中对 CR 的写入
+    // 不会再触发 VM-Exit（直接在 Guest 模式下生效）
+    __vmx_vmwrite(CR0_GUEST_HOST_MASK, 0);
+    __vmx_vmwrite(CR4_GUEST_HOST_MASK, 0);
+    __vmx_vmwrite(CR0_READ_SHADOW, 0);
+    __vmx_vmwrite(CR4_READ_SHADOW, 0);
+
+    // 清除异常 bitmap，避免 Trampoline 中的指令触发意外 VM-Exit
+    __vmx_vmwrite(EXCEPTION_BITMAP, 0);
+
+    // vmresume 将切换到 Guest，Guest RIP = Trampoline
+    // Trampoline 执行 vmxoff → 恢复 CR → 恢复寄存器 → iretq
+    // 不返回
 }
 
 
@@ -322,14 +332,10 @@ VOID VmExitHandler(PGUEST_REGS GuestRegs)
         ULONG32 HypercallNumber = (ULONG32)(GuestRegs->rcx & 0xffff);
         switch (HypercallNumber) {
         case NBP_HYPERCALL_UNLOAD:
-            // VmxShutdown 不再分配内存，直接使用预分配页
-            // 如果成功，它会跳转到 Trampoline 永远不返回
             VmxShutdown(GuestRegs);
-            // 如果到达这里，说明 Trampoline 为 NULL（回退路径）
-            // 设置返回值让调用方知道卸载已完成
-            GuestRegs->rcx = NBP_MAGIC;
-            GuestRegs->rdx = 0;
-            break;
+            // VmxShutdown 修改了 GUEST_RIP 指向 Trampoline
+            // 返回到 VmxVmexitHandler 的 vmresume 即可
+            return;  // 不要再修改 GUEST_RIP
         default:
             break;
         }
